@@ -1,0 +1,19 @@
+{
+  "name": "@devkit/flags-example-basic-usage",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts"
+  },
+  "dependencies": {
+    "@devkit/flags": "latest"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "stackblitz": {
+    "startCommand": "npm start"
+  }
+}
