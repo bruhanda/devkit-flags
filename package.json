@@ -139,7 +139,6 @@
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:types": "vitest run --typecheck",
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench",
     "lint": "biome check .",
