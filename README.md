@@ -38,6 +38,7 @@ Zero-dependency, type-safe feature flags for TypeScript — core ≤ 3 KB gzippe
 - [Configuration options](#configuration-options)
 - [TypeScript features](#typescript-features)
 - [CLI](#cli)
+- [Examples](#examples)
 - [Comparison](#comparison)
 - [Contributing](#contributing)
 - [License](#license)
@@ -814,6 +815,28 @@ await runCodegen({ inPath: 'flags.json', outPath: 'src/flags.generated.ts' });
 const lintReport = await runLint({ flagsJsonPath: 'flags.json', srcRoot: 'src' });
 const auditReport = await runAudit({ flagsJsonPath: 'flags.json' });
 ```
+
+---
+
+## Examples
+
+Runnable end-to-end examples live under [`examples/`](./examples). Each is a self-contained `tsx` script you can run after `npm install && npm run build`:
+
+```bash
+npx tsx examples/basic-usage.ts       # core API, type narrowing, percentage rollout
+npx tsx examples/advanced-usage.ts    # segments, multivariate rollout, JSON source, observability
+npx tsx examples/with-hono.ts         # Hono middleware exercised via app.fetch()
+npx tsx examples/with-express.ts      # Express middleware + env-var overlay
+```
+
+Every example also has a one-click StackBlitz sandbox under [`examples/sandbox/`](./examples/sandbox):
+
+| Sandbox                                              | Open in StackBlitz                                                                                                                                                                                            |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`basic-usage`](./examples/sandbox/basic-usage)      | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/devkit-flags/tree/main/examples/sandbox/basic-usage)                               |
+| [`advanced-usage`](./examples/sandbox/advanced-usage)| [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/devkit-flags/tree/main/examples/sandbox/advanced-usage)                            |
+| [`with-hono`](./examples/sandbox/with-hono)          | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/devkit-flags/tree/main/examples/sandbox/with-hono)                                 |
+| [`with-express`](./examples/sandbox/with-express)    | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/devkit-flags/tree/main/examples/sandbox/with-express)                              |
 
 ---
 
