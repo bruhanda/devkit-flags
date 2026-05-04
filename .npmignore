@@ -1,0 +1,93 @@
+# `package.json#files` is the source of truth for what ships to npm.
+# This file is a defense-in-depth allowlist — anything not in `files`
+# is excluded by default, but we explicitly list common offenders here
+# so a future `files` widening doesn't accidentally publish them.
+
+# Source & build inputs
+src
+node_modules
+*.tsbuildinfo
+.tsbuildinfo
+
+# Tests, coverage, fixtures
+__tests__
+*.test.ts
+*.test.tsx
+*.test.js
+*.bench.ts
+*.spec.ts
+coverage
+.nyc_output
+.vitest-cache
+
+# Examples / sandbox / scratch
+examples
+example
+sandbox
+playground
+scripts
+benchmarks
+bench
+
+# Configs not needed at install time
+tsconfig.json
+tsconfig.*.json
+tsup.config.ts
+vitest.config.ts
+biome.json
+biome.jsonc
+.size-limit.json
+.size-limit.cjs
+
+# Plans, internal docs, review notes
+PLAN.md
+REVIEW.md
+TODO.md
+NOTES.md
+docs
+.changeset
+
+# CI / repo metadata
+.github
+.gitlab
+.gitea
+.circleci
+.git
+.gitignore
+.gitattributes
+.editorconfig
+
+# Linter / formatter caches
+.eslintrc*
+.eslintcache
+.prettierrc*
+.prettierignore
+
+# Bundler / framework caches
+.cache
+.turbo
+.next
+.nuxt
+.svelte-kit
+.wrangler
+.vercel
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+*.pem
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+*.swp
+*.swo
