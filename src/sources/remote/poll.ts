@@ -19,9 +19,17 @@ export function backoffDelay(strategy: BackoffStrategy, attempt: number): number
  * Node `Timer` types so the source bundle survives `tsup` minification
  * for edge runtimes. Pause-aware: `stop()` clears the timer and
  * resets the backoff on the next `start()`.
+ *
+ * Internal note: `intervalHandle` and `backoffHandle` are tracked
+ * separately because `start()` may be called either from `setInterval`
+ * (steady state) or from a `setTimeout` armed by the failure path.
+ * Conflating them once led to a silent-source bug: the re-arm closure
+ * left `intervalHandle` pointing at an already-fired timeout id, which
+ * tripped the early-return guard on the next `start()`.
  */
 export class IntervalDriver {
-  private handle: ReturnType<typeof setInterval> | undefined;
+  private intervalHandle: ReturnType<typeof setInterval> | undefined;
+  private backoffHandle: ReturnType<typeof setTimeout> | undefined;
   private failures = 0;
 
   constructor(
@@ -31,7 +39,7 @@ export class IntervalDriver {
   ) {}
 
   start(): void {
-    if (this.handle !== undefined) return;
+    if (this.intervalHandle !== undefined) return;
     const driver = (): void => {
       void this.tick().then(
         () => {
@@ -39,23 +47,26 @@ export class IntervalDriver {
         },
         () => {
           this.failures += 1;
-          // Reschedule with backoff
           this.stop();
           const delay = backoffDelay(this.strategy, this.failures);
-          this.handle = setTimeout(() => {
+          this.backoffHandle = setTimeout(() => {
+            this.backoffHandle = undefined;
             this.start();
           }, delay);
         },
       );
     };
-    this.handle = setInterval(driver, this.intervalMs);
+    this.intervalHandle = setInterval(driver, this.intervalMs);
   }
 
   stop(): void {
-    if (this.handle !== undefined) {
-      clearInterval(this.handle as unknown as ReturnType<typeof setInterval>);
-      clearTimeout(this.handle as unknown as ReturnType<typeof setTimeout>);
-      this.handle = undefined;
+    if (this.intervalHandle !== undefined) {
+      clearInterval(this.intervalHandle);
+      this.intervalHandle = undefined;
+    }
+    if (this.backoffHandle !== undefined) {
+      clearTimeout(this.backoffHandle);
+      this.backoffHandle = undefined;
     }
   }
 }

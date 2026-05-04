@@ -27,6 +27,14 @@ export type FlagsListener = (snapshot: FlagSourceSnapshot) => void;
  * The runtime handle returned by `defineFlags` / `createFlags`. Exposes
  * a dual sync/async surface — `get*` reads the current frozen snapshot
  * synchronously; `get*Async` awaits initial load on first call.
+ *
+ * Default-value detection: the `get` / `getAsync` overloads with a
+ * `defaultValue` parameter distinguish "no default supplied" from
+ * "default supplied as `undefined`" by inspecting `arguments.length`.
+ * Calling sites that build the args array dynamically (`fn(...args)`)
+ * therefore matter: spreading a 2-element tuple is "no default", a
+ * 3-element tuple (even with `undefined` at index 2) is "default
+ * supplied".
  */
 export interface FlagsHandle<
   TSchema extends FlagSchema = FlagSchema,
@@ -69,6 +77,14 @@ export interface FlagsHandle<
   subscribe(listener: FlagsListener): () => void;
   reload(): Promise<FlagSourceSnapshot>;
   dispose(): Promise<void>;
+
+  /**
+   * Monotonic counter — bumped on every `rebuild` / `reload` /
+   * `initialise`. Used by adapters (e.g. the React `useFlags` hook)
+   * to memoize derived projections so `useSyncExternalStore`'s
+   * `Object.is` snapshot check stays stable across renders.
+   */
+  version(): number;
 
   readonly config: Readonly<FlagsHandleConfig<TSchema>>;
   snapshot(): FlagSourceSnapshot;

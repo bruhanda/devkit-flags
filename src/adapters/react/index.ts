@@ -23,6 +23,12 @@ import type { FlagSourceSnapshot } from '../../types/source.js';
 interface ContextValue<S extends FlagSchema, A extends AttributeSchema> {
   readonly handle: FlagsHandle<S, A>;
   readonly evaluation?: EvaluationContext<A, S>;
+  /**
+   * SSR hydration snapshot. Used as the `getServerSnapshot` return for
+   * `useSyncExternalStore` so the server-rendered HTML and the first
+   * client read agree before the client-side handle finishes loading.
+   */
+  readonly initialSnapshot?: FlagSourceSnapshot;
 }
 
 const FlagsContext = createContext<ContextValue<FlagSchema, AttributeSchema> | null>(
@@ -53,13 +59,12 @@ export function FlagsProvider<S extends FlagSchema, A extends AttributeSchema>(
     () => ({
       handle: props.flags,
       ...(props.context !== undefined ? { evaluation: props.context } : {}),
+      ...(props.initialSnapshot !== undefined
+        ? { initialSnapshot: props.initialSnapshot }
+        : {}),
     }),
-    [props.flags, props.context],
+    [props.flags, props.context, props.initialSnapshot],
   );
-  // `initialSnapshot` is a hydration hint — surface to consumers via
-  // a `data-` attribute on a wrapping fragment is overkill; we accept
-  // the prop for parity with the spec and let RSC streamers pick it up.
-  void props.initialSnapshot;
   return createElement(
     FlagsContext.Provider,
     { value: value as ContextValue<FlagSchema, AttributeSchema> },
@@ -84,6 +89,11 @@ function useHandleContext<S extends FlagSchema, A extends AttributeSchema>(): Co
  * Subscribe to a single flag's value. Concurrent-mode safe via
  * `useSyncExternalStore`. Re-renders when the snapshot swaps OR when
  * the surrounding `EvaluationContext` changes.
+ *
+ * Snapshot identity is stabilised by the handle itself (`getAll` /
+ * `getDetail` cache the result per `(version, contextRef)`), so this
+ * adapter does not need a wrapper memo to avoid `useSyncExternalStore`
+ * tearing.
  */
 export function useFlag<S extends FlagSchema, K extends FlagKeysOf<S>>(
   key: K,
@@ -99,7 +109,16 @@ export function useFlag<S extends FlagSchema, K extends FlagKeysOf<S>>(
       ? ctx.handle.get(key, ctx.evaluation as never, fallback as never)
       : ctx.handle.get(key, ctx.evaluation as never);
   }, [ctx.handle, ctx.evaluation, key, fallback]);
-  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const getServerSnapshot = useCallback(() => {
+    if (ctx.initialSnapshot !== undefined) {
+      const spec = ctx.initialSnapshot.flags[key as string];
+      if (spec !== undefined) return spec.default as FlagValueOf<S, K>;
+    }
+    return fallback !== undefined
+      ? (fallback as FlagValueOf<S, K>)
+      : (undefined as unknown as FlagValueOf<S, K>);
+  }, [ctx.initialSnapshot, key, fallback]);
+  return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 }
 
 /** Read full evaluation result (reason / bucket / ruleId). */

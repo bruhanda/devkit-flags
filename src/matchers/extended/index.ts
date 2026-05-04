@@ -33,11 +33,11 @@ const endsWith: MatcherFn = (expected, actual) =>
 
 const customMatcher: MatcherFn = (expected, actual) => {
   if (typeof expected !== 'function') return false;
-  try {
-    return Boolean((expected as (v: Json | undefined) => boolean)(actual));
-  } catch {
-    return false;
-  }
+  // Intentionally do NOT swallow the throw here. `evaluateMatcher` in
+  // `core/rules.ts` catches it and forwards to the observability hook
+  // with `code: 'RULE_EVAL_ERROR'` so callers can diagnose a buggy
+  // `custom` matcher instead of silently treating it as `false`.
+  return Boolean((expected as (v: Json | undefined) => boolean)(actual));
 };
 
 /**

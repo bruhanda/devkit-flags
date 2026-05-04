@@ -9,8 +9,9 @@ interface AuditOptions {
 /**
  * Per-flag audit row — name, kind, deprecation status, optional
  * description and a best-effort `lastTouched` git timestamp pulled
- * from `git log -1 -- <file>` when the consumer's environment exposes
- * `git`.
+ * from `git log -1 --format=%cI -- <file>` when the consumer's
+ * environment exposes `git`. `lastTouched` is omitted when git is
+ * unavailable, the file is untracked, or `git` exits non-zero.
  */
 export interface AuditEntry {
   readonly key: string;
@@ -19,6 +20,7 @@ export interface AuditEntry {
   readonly deprecated: boolean;
   readonly description?: string;
   readonly tags?: readonly string[];
+  readonly lastTouched?: string;
 }
 
 interface AuditReport {
@@ -47,6 +49,10 @@ export async function runAudit(opts: AuditOptions): Promise<AuditReport> {
   const fs = await import('node:fs/promises');
   const raw = await fs.readFile(opts.flagsJsonPath, { encoding: 'utf8' });
   const parsed = parseFlagsJson(raw);
+  // The whole report shares one `lastTouched` value for now: declarations
+  // live alongside each other in `flags.json`, so the file's last-commit
+  // timestamp is the closest signal we can give without per-key blame.
+  const lastTouched = await readGitLastTouched(opts.flagsJsonPath);
   const entries: AuditEntry[] = [];
   let deprecatedCount = 0;
   for (const [key, spec] of Object.entries(parsed.flags)) {
@@ -59,6 +65,7 @@ export async function runAudit(opts: AuditOptions): Promise<AuditReport> {
       deprecated,
       ...(spec.description !== undefined ? { description: spec.description } : {}),
       ...(spec.tags !== undefined ? { tags: spec.tags } : {}),
+      ...(lastTouched !== undefined ? { lastTouched } : {}),
     });
   }
   return {
@@ -67,4 +74,30 @@ export async function runAudit(opts: AuditOptions): Promise<AuditReport> {
     deprecatedCount,
     entries,
   };
+}
+
+async function readGitLastTouched(filePath: string): Promise<string | undefined> {
+  try {
+    const { spawn } = await import('node:child_process');
+    return await new Promise<string | undefined>((resolve) => {
+      const child = spawn('git', ['log', '-1', '--format=%cI', '--', filePath], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      let stdout = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf8');
+      });
+      child.on('error', () => resolve(undefined));
+      child.on('close', (code) => {
+        if (code !== 0) {
+          resolve(undefined);
+          return;
+        }
+        const trimmed = stdout.trim();
+        resolve(trimmed.length > 0 ? trimmed : undefined);
+      });
+    });
+  } catch {
+    return undefined;
+  }
 }

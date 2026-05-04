@@ -68,6 +68,10 @@ export function createEnvSource(opts?: EnvSourceOptions): FlagSource {
 
   const listeners = new Set<(s: FlagSourceSnapshot) => void>();
   const warnedCollisions = new Set<string>();
+  // Tracks the env-keys we've already iterated for collision-warning
+  // purposes. The full host env can be hundreds of vars on production
+  // boxes; without this we'd re-scan on every `reload()`.
+  const scannedKeys = new Set<string>();
   let cachedSchema: Readonly<Record<string, FlagSpec>> = {};
   let snapshot: FlagSourceSnapshot | undefined;
 
@@ -77,7 +81,11 @@ export function createEnvSource(opts?: EnvSourceOptions): FlagSource {
 
   function buildSnapshot(): FlagSourceSnapshot {
     const env = readEnv();
-    const flags: Record<string, FlagSpec> = {};
+    // Null-prototype map so `__proto__`/`constructor`/`prototype`
+    // collisions can never reach `Object.prototype`. The schema-derived
+    // allowlist below already excludes them in practice, but defence
+    // in depth keeps the parser-shaped guarantees consistent.
+    const flags: Record<string, FlagSpec> = Object.create(null);
     const allowSet =
       allow === '*' || allow === undefined
         ? undefined
@@ -109,9 +117,15 @@ export function createEnvSource(opts?: EnvSourceOptions): FlagSource {
         const overlay = buildOverlay(spec, raw);
         if (overlay !== undefined) flags[flagKey] = overlay;
       }
-      // Warn on prefix collisions outside the allowlist.
+      // Warn on prefix collisions outside the allowlist. Only inspect
+      // env-keys we haven't seen on a previous `reload()` — production
+      // boxes routinely carry hundreds of unrelated env-vars and the
+      // collision check is the dominant cost of a snapshot rebuild
+      // otherwise.
       if (allow === undefined) {
         for (const envName of Object.keys(env)) {
+          if (scannedKeys.has(envName)) continue;
+          scannedKeys.add(envName);
           if (!envName.startsWith(prefix)) continue;
           const stem = envName.slice(prefix.length);
           const declared = schemaKeys.some((k) => transform(k) === stem);

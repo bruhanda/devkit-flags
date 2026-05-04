@@ -1,7 +1,7 @@
 import { FlagsError } from '../../errors/base.js';
 import type { FlagSpec } from '../../types/flag-spec.js';
 import type { Json } from '../../types/json.js';
-import type { Matcher, Rollout, Rule, RuleGroup } from '../../types/rules.js';
+import type { Matcher, Operator, Rollout, Rule, RuleGroup } from '../../types/rules.js';
 
 /** On-disk JSON shape parsed by `parseFlagsJson`. */
 export interface FlagsJson {
@@ -21,6 +21,32 @@ const KNOWN_TOP_LEVEL = new Set(['$schema', 'flags', 'environments', 'segments']
 const KNOWN_KINDS = new Set(['boolean', 'string', 'number', 'json']);
 const REGEX_LITERAL_MAX = 1024;
 const REGEX_LOOKBEHIND_MAX_DEPTH = 3;
+
+// Every matcher operator that may legitimately appear in JSON. `custom`
+// is intentionally absent — it is hard-rejected with
+// `UNSAFE_MATCHER_FROM_JSON` because its `(value) => boolean` callback
+// shape is unrepresentable in JSON. `flags` is recognised as a sibling
+// modifier of `regex`, not a standalone op.
+const KNOWN_MATCHER_OPS = new Set<Operator>([
+  'eq',
+  'neq',
+  'in',
+  'nin',
+  'exists',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'regex',
+  'contains',
+  'startsWith',
+  'endsWith',
+]);
+
+// Keys that mutate the prototype chain on V8 if assigned via bracket
+// notation. Filtered at every untrusted-JSON boundary so a remote
+// payload cannot pollute `Object.prototype`.
+const PROTO_BLOCKED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
  * Validate-and-parse a `FlagsJson` payload. Returns the typed
@@ -62,10 +88,11 @@ export function parseFlagsJson(raw: string | unknown): ParsedFlagsJson {
 
   // Two-pass: parse segment names first so we can validate
   // `{ $segment: 'name' }` references during flag parsing.
-  const segments: Record<string, RuleGroup> = {};
+  const segments: Record<string, RuleGroup> = Object.create(null);
   if (json.segments !== undefined) {
     invariantObj(json.segments, 'segments must be an object');
     for (const name of Object.keys(json.segments)) {
+      assertSafeKey('segments', name);
       // pre-register names; populate after.
       segments[name] = {} as RuleGroup;
     }
@@ -77,12 +104,22 @@ export function parseFlagsJson(raw: string | unknown): ParsedFlagsJson {
     }
   }
 
-  const flags: Record<string, FlagSpec> = {};
+  const flags: Record<string, FlagSpec> = Object.create(null);
   for (const [key, entry] of Object.entries(json.flags)) {
+    assertSafeKey('flags', key);
     flags[key] = parseFlagEntry(key, entry, segments);
   }
 
   return { flags, segments };
+}
+
+function assertSafeKey(scope: string, key: string): void {
+  if (PROTO_BLOCKED_KEYS.has(key)) {
+    throw new FlagsError(
+      'INVALID_SCHEMA',
+      `${scope}: key "${key}" is reserved and cannot appear in JSON`,
+    );
+  }
 }
 
 function safeParse(raw: string): unknown {
@@ -107,10 +144,9 @@ function parseFlagEntry(
       `flag "${key}": kind must be one of boolean|string|number|json`,
     );
   }
-  const base: Record<string, unknown> = {
-    kind,
-    default: spec['default'],
-  };
+  const base: Record<string, unknown> = Object.create(null);
+  base['kind'] = kind;
+  base['default'] = spec['default'];
   if (typeof spec['description'] === 'string') {
     base['description'] = spec['description'];
   }
@@ -122,7 +158,14 @@ function parseFlagEntry(
   }
   if (spec['environments'] !== undefined) {
     invariantObj(spec['environments'], `flag "${key}": environments must be an object`);
-    base['environments'] = spec['environments'];
+    const envMap: Record<string, unknown> = Object.create(null);
+    for (const [envKey, envValue] of Object.entries(
+      spec['environments'] as Record<string, unknown>,
+    )) {
+      if (PROTO_BLOCKED_KEYS.has(envKey)) continue;
+      envMap[envKey] = envValue;
+    }
+    base['environments'] = envMap;
   }
   if (kind === 'string') {
     if (Array.isArray(spec['values'])) {
@@ -163,7 +206,7 @@ function parseRule(
 ): Rule<unknown> {
   invariantObj(raw, `${label}: rule must be an object`);
   const rule = raw as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = Object.create(null);
   if (typeof rule['id'] === 'string') out['id'] = rule['id'];
   if (typeof rule['description'] === 'string') out['description'] = rule['description'];
   if (rule['when'] !== undefined) {
@@ -224,8 +267,9 @@ function parseRuleGroup(
     return { $segment: name };
   }
   // Implicit-AND map of attribute matchers.
-  const out: Record<string, Matcher> = {};
+  const out: Record<string, Matcher> = Object.create(null);
   for (const [attr, matcher] of Object.entries(group)) {
+    if (PROTO_BLOCKED_KEYS.has(attr)) continue;
     out[attr] = parseMatcher(`${label}.${attr}`, matcher);
   }
   return out as unknown as RuleGroup;
@@ -239,6 +283,18 @@ function parseMatcher(label: string, raw: unknown): Matcher {
       'UNSAFE_MATCHER_FROM_JSON',
       `${label}: "custom" matchers cannot be loaded from JSON / remote sources`,
     );
+  }
+  // Reject unknown operators at parse time. Catches typos like
+  // `{ equals: 'pro' }` instead of `{ eq: 'pro' }` that would
+  // otherwise ship to production and silently match nobody.
+  for (const op of Object.keys(m)) {
+    if (op === 'flags' && 'regex' in m) continue;
+    if (!KNOWN_MATCHER_OPS.has(op as Operator)) {
+      throw new FlagsError(
+        'INVALID_SCHEMA',
+        `${label}: unknown matcher operator "${op}"`,
+      );
+    }
   }
   if ('regex' in m) {
     const pattern = m['regex'];
@@ -283,10 +339,11 @@ function parseRollout(label: string, raw: unknown): Rollout<unknown> {
   }
   if ('variants' in rollout) {
     invariantObj(rollout['variants'], `${label}: variants must be an object`);
-    const out: Record<string, number> = {};
+    const out: Record<string, number> = Object.create(null);
     for (const [name, weight] of Object.entries(
       rollout['variants'] as Record<string, unknown>,
     )) {
+      if (PROTO_BLOCKED_KEYS.has(name)) continue;
       if (typeof weight !== 'number' || !Number.isFinite(weight)) {
         throw new FlagsError(
           'INVALID_SCHEMA',

@@ -1,5 +1,6 @@
 import { deepFreeze } from '../../utils/freeze.js';
 import type { FlagSpec } from '../../types/flag-spec.js';
+import type { RuleGroup } from '../../types/rules.js';
 import type {
   FlagSource,
   FlagSourceSnapshot,
@@ -91,8 +92,9 @@ function mergeSnapshots(
   layers: readonly FlagSourceSnapshot[],
   opts?: ComposeOptions,
 ): FlagSourceSnapshot {
-  const flags: Record<string, FlagSpec> = {};
-  const seenLayers: Record<string, FlagSpec[]> = {};
+  const flags: Record<string, FlagSpec> = Object.create(null);
+  const segments: Record<string, RuleGroup> = Object.create(null);
+  const seenLayers: Record<string, FlagSpec[]> = Object.create(null);
   let stale = false;
   let fetchedAt = 0;
 
@@ -109,6 +111,11 @@ function mergeSnapshots(
         flags[key] = spec;
       }
     }
+    if (layer.segments !== undefined) {
+      for (const [name, group] of Object.entries(layer.segments)) {
+        segments[name] = group;
+      }
+    }
   }
 
   if (opts?.merge !== undefined) {
@@ -119,6 +126,7 @@ function mergeSnapshots(
 
   return deepFreeze({
     flags,
+    segments,
     origin: 'compose' as const,
     stale,
     fetchedAt: fetchedAt === 0 ? Date.now() : fetchedAt,

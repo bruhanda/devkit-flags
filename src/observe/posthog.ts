@@ -16,7 +16,9 @@ export interface PostHogLikeClient {
  *
  * Intentionally strips `subject.attributes` before fan-out — PostHog
  * already stores user properties out of band; flag-evaluation events
- * should not duplicate them. Set `forwardAttributes: true` to override.
+ * should not duplicate them. Consumers who need attributes in PostHog
+ * should opt back in with `defineFlags({ redactSubject: (s) => s })`
+ * — the redactor runs upstream of every tap, including this one.
  *
  * @param client  Any object exposing `capture({ event, properties, distinctId })`.
  * @returns       An `OnEvaluation` hook ready to plug into `defineFlags`.

@@ -5,10 +5,10 @@ import type {
   EvaluationResult,
   EvaluationSource,
 } from '../types/result.js';
-import type { Rollout, Rule, RuleGroup } from '../types/rules.js';
+import type { Rollout, RuleGroup } from '../types/rules.js';
 import { bucketFor, variantBucketFor } from './bucket.js';
 import { clampNumber, coerce } from './coerce.js';
-import { matchRule } from './rules.js';
+import { matchRule, type RuleEvalErrorReporter } from './rules.js';
 
 interface EvaluateOptions {
   readonly key: string;
@@ -24,6 +24,11 @@ interface EvaluateOptions {
   readonly callOverride?: unknown;
   /** Hook fired for every analytics-only rule that matched. */
   readonly recordExposure?: (key: string, ruleId: string | undefined) => void;
+  /**
+   * Forwarded to `matchRule`. Fires once per `RULE_EVAL_ERROR` —
+   * segment cycle or throwing matcher.
+   */
+  readonly reportRuleError?: RuleEvalErrorReporter;
 }
 
 /**
@@ -43,13 +48,25 @@ export function evaluateFlag(opts: EvaluateOptions): EvaluationResult {
     return finalize(opts.callOverride, 'OVERRIDE', spec, key, source, stale);
   }
 
+  // Read the env-override candidate up front. PLAN §3.1 deliberately
+  // applies it AFTER rules walk: targeting rules are an explicit
+  // user-defined override, environments are a coarse-grained switch,
+  // so a matched `{ when: ..., value: X }` rule beats a per-env
+  // default. The env override re-enters at:
+  //   • step 1's "rules existed but none returned a value" fallthrough
+  //   • step 3 (no rules and no flag-level rollout, beats spec.default)
   const envValue =
     spec.environments !== undefined ? spec.environments[environment] : undefined;
+
+  const matchOpts = {
+    segments,
+    ...(opts.reportRuleError !== undefined ? { reportError: opts.reportRuleError } : {}),
+  };
 
   // 1. Targeting rules (rules existing OR matched override).
   if (spec.rules !== undefined && spec.rules.length > 0) {
     for (const rule of spec.rules) {
-      if (rule.when !== undefined && !matchRule(rule.when, context, segments)) {
+      if (rule.when !== undefined && !matchRule(rule.when, context, matchOpts)) {
         continue;
       }
 
@@ -59,15 +76,16 @@ export function evaluateFlag(opts: EvaluateOptions): EvaluationResult {
         continue;
       }
 
+      const ruleRollout = rule.rollout as Rollout<unknown> | undefined;
       const subjectId = resolveSubjectId(
-        rule.rollout as unknown as Rollout<unknown> | undefined,
+        ruleRollout,
         context,
         opts.defaultSubjectId,
       );
 
-      if (rule.rollout !== undefined) {
+      if (ruleRollout !== undefined) {
         const decision = applyRollout(
-          rule.rollout as unknown as Rollout<unknown>,
+          ruleRollout,
           salt,
           ruleBucketKey(key, rule.id),
           subjectId,
@@ -100,14 +118,15 @@ export function evaluateFlag(opts: EvaluateOptions): EvaluationResult {
     if (envValue !== undefined) {
       return finalize(envValue, 'ENVIRONMENT', spec, key, source, stale);
     }
-    if (spec.rollout !== undefined) {
+    const flagRollout = spec.rollout as Rollout<unknown> | undefined;
+    if (flagRollout !== undefined) {
       const subjectId = resolveSubjectId(
-        spec.rollout as unknown as Rollout<unknown> | undefined,
+        flagRollout,
         context,
         opts.defaultSubjectId,
       );
       const decision = applyRollout(
-        spec.rollout as unknown as Rollout<unknown>,
+        flagRollout,
         salt,
         key,
         subjectId,
@@ -130,14 +149,15 @@ export function evaluateFlag(opts: EvaluateOptions): EvaluationResult {
   }
 
   // 2. Flag-level rollout (no targeting rules).
-  if (spec.rollout !== undefined) {
+  const noRulesRollout = spec.rollout as Rollout<unknown> | undefined;
+  if (noRulesRollout !== undefined) {
     const subjectId = resolveSubjectId(
-      spec.rollout as unknown as Rollout<unknown> | undefined,
+      noRulesRollout,
       context,
       opts.defaultSubjectId,
     );
     const decision = applyRollout(
-      spec.rollout as unknown as Rollout<unknown>,
+      noRulesRollout,
       salt,
       key,
       subjectId,

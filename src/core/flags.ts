@@ -64,6 +64,11 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
   const subscriptions: (() => void)[] = [];
   let disposed = false;
   let readyResolved = sources.every((s) => s.snapshot() !== undefined);
+  let initialised = false;
+  // Bumped on every snapshot swap. Adapters key derived projections
+  // (`useFlags`, `useFlagResult`) on this so React's `Object.is` check
+  // sees a stable reference until the snapshot actually changes.
+  let snapshotVersion = 0;
 
   let merged = makeMerged();
 
@@ -71,6 +76,9 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
     const snapshots = await Promise.all(sources.map((s) => s.load()));
     merged = composeSnapshots(snapshots);
     readyResolved = true;
+    initialised = true;
+    snapshotVersion += 1;
+    invalidateProjectionCaches();
     fanout();
     return merged;
   });
@@ -78,6 +86,10 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
   for (const source of sources) {
     subscriptions.push(
       source.subscribe(() => {
+        // Drop fan-out from synchronous source callbacks fired during
+        // the first `Promise.all(sources.map(s => s.load()))` —
+        // `initialise` will assign the post-load `merged` itself.
+        if (!initialised) return;
         rebuild();
       }),
     );
@@ -106,7 +118,26 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
 
   function rebuild(): void {
     merged = makeMerged();
+    snapshotVersion += 1;
+    invalidateProjectionCaches();
     fanout();
+  }
+
+  // Per-(version, contextRef) projection caches. `useSyncExternalStore`
+  // (and the SvelteKit / Vue equivalents) call `getSnapshot()` on every
+  // render and compare with `Object.is`; without this, every render
+  // sees a fresh frozen object and either tears or infinite-loops.
+  let lastGetAll:
+    | { ctx: EvaluationContext | undefined; version: number; result: unknown }
+    | undefined;
+  const lastGetDetail = new Map<
+    string,
+    { ctx: EvaluationContext | undefined; version: number; result: EvaluationResult }
+  >();
+
+  function invalidateProjectionCaches(): void {
+    lastGetAll = undefined;
+    lastGetDetail.clear();
   }
 
   function fanout(): void {
@@ -146,6 +177,7 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
 
     const callOverride = ctx.overrides?.[key as never];
     const exposureFired = new Set<string>();
+    let ruleError: { code: string; message: string } | undefined;
 
     let result = evaluateFlag({
       key,
@@ -158,6 +190,15 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
       segments: { ...segmentsConfig, ...merged.segments },
       ...(config.subjectId !== undefined ? { defaultSubjectId: config.subjectId } : {}),
       ...(callOverride !== undefined ? { callOverride } : {}),
+      reportRuleError: (info) => {
+        const message =
+          info.kind === 'segment-cycle'
+            ? `cycle detected resolving $segment "${info.name}"`
+            : `matcher "${info.name}" threw: ${
+                info.cause instanceof Error ? info.cause.message : String(info.cause)
+              }`;
+        ruleError = { code: 'RULE_EVAL_ERROR', message };
+      },
       recordExposure: (flagKey, ruleId) => {
         const tag = `${flagKey}::${ruleId ?? ''}`;
         if (exposureFired.has(tag)) return;
@@ -193,7 +234,11 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
       result = { ...result, value: callDefault };
     }
 
-    emit(result, ctx, env);
+    if (ruleError !== undefined) {
+      emit(result, ctx, env, ruleError.code, ruleError.message);
+    } else {
+      emit(result, ctx, env);
+    }
     return result;
   }
 
@@ -244,19 +289,38 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
       return result.value as never;
     },
     getAll(context?: EvaluationContext) {
+      if (
+        lastGetAll !== undefined &&
+        lastGetAll.ctx === context &&
+        lastGetAll.version === snapshotVersion
+      ) {
+        return lastGetAll.result as never;
+      }
       const out: Record<string, unknown> = {};
       for (const key of Object.keys(merged.flags)) {
         const result = evaluate(key, context, undefined, false);
         out[key] = result.value;
       }
-      return deepFreeze(out) as never;
+      const frozen = deepFreeze(out);
+      lastGetAll = { ctx: context, version: snapshotVersion, result: frozen };
+      return frozen as never;
     },
     async getAllAsync(context?: EvaluationContext) {
       await initialise();
       return handle.getAll(context);
     },
     getDetail(key: string, context?: EvaluationContext) {
-      return evaluate(key, context, undefined, false) as never;
+      const cached = lastGetDetail.get(key);
+      if (
+        cached !== undefined &&
+        cached.ctx === context &&
+        cached.version === snapshotVersion
+      ) {
+        return cached.result as never;
+      }
+      const result = evaluate(key, context, undefined, false);
+      lastGetDetail.set(key, { ctx: context, version: snapshotVersion, result });
+      return result as never;
     },
     async getDetailAsync(key: string, context?: EvaluationContext) {
       await initialise();
@@ -280,6 +344,9 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
       );
       merged = composeSnapshots(snapshots);
       readyResolved = true;
+      initialised = true;
+      snapshotVersion += 1;
+      invalidateProjectionCaches();
       fanout();
       return toPublicSnapshot(merged);
     },
@@ -304,6 +371,9 @@ export function createFlags(config: CreateFlagsConfig): FlagsHandle {
           }
         }
       }
+    },
+    version() {
+      return snapshotVersion;
     },
     config: normalisedConfig as Readonly<FlagsHandleConfig<FlagSchema>>,
     snapshot() {

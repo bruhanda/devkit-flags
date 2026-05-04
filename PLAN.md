@@ -602,7 +602,7 @@ strips it from the published `.d.ts` rollup.
  *                            to full attributes. See §2.10 / §9.23.
  *
  * @returns Frozen `FlagsHandle<TSchema>` exposing
- *          `.get(key, ctx?)`, `.getAll(ctx?)`, `.peek(key, ctx?)`,
+ *          `.get(key, ctx?)`, `.getAll(ctx?)`, `.getDetail(key, ctx?)`,
  *          `.subscribe(listener)`, `.reload()`, `.dispose()` and
  *          read-only `.config` / `.snapshot()`.
  *
@@ -1991,7 +1991,7 @@ file under `src/cli/`, parses arguments via a 50-LOC vendored parser
         ┌───────────────┼─────────────────────────────────┐       │
         │               │                                 │       │
         ▼               ▼                                 ▼       │
-     get(k,ctx)    getAll(ctx)                         peek(k,ctx)│
+     get(k,ctx)    getAll(ctx)                       getDetail(k,ctx)│
         │               │                                 │       │
         └───────┬───────┴────────────────────┬────────────┘       │
                 ▼                            ▼                    │
@@ -2793,7 +2793,7 @@ flows back to consumers without manual invalidation.
 
 Tears down: file watchers, polling intervals, SSE connections,
 internal observability batchers. Idempotent — calling twice is a
-no-op. After dispose, subsequent `get()` / `peek()` calls **continue
+no-op. After dispose, subsequent `get()` / `getDetail()` calls **continue
 to work** against the last-known frozen snapshot — this matches the
 "safe to call from anywhere" invariant.
 

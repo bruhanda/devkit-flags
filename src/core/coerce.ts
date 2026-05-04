@@ -1,4 +1,5 @@
 import { FlagsError } from '../errors/base.js';
+import { deepFreeze } from '../utils/freeze.js';
 import type { FlagKind } from '../types/flag-kind.js';
 import type { Json } from '../types/json.js';
 
@@ -81,7 +82,7 @@ function coerceJson(raw: unknown): Json {
     const trimmed = raw.trim();
     if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed === 'null') {
       try {
-        return JSON.parse(trimmed) as Json;
+        return deepFreeze(JSON.parse(trimmed) as Json);
       } catch (cause) {
         throw new FlagsError('TYPE_MISMATCH', 'invalid JSON literal', { cause });
       }
@@ -89,7 +90,12 @@ function coerceJson(raw: unknown): Json {
     return raw;
   }
   if (typeof raw === 'number' || typeof raw === 'boolean') return raw;
-  if (Array.isArray(raw) || (typeof raw === 'object' && raw !== null)) return raw as Json;
+  if (Array.isArray(raw) || (typeof raw === 'object' && raw !== null)) {
+    // Freeze the returned reference so a consumer mutating the object
+    // they got from `flags.get('jsonFlag')` cannot retroactively change
+    // the underlying `FlagSpec.default` for every other reader.
+    return deepFreeze(raw as Json);
+  }
   throw new FlagsError('TYPE_MISMATCH', `cannot coerce ${stringify(raw)} to json`);
 }
 
