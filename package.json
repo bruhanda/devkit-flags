@@ -91,6 +91,10 @@
       "types": "./dist/observe/index.d.ts",
       "import": "./dist/observe/index.js"
     },
+    "./cli": {
+      "types": "./dist/cli/index.d.ts",
+      "import": "./dist/cli/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
