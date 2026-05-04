@@ -1,26 +1,38 @@
 # `@devkit/flags` — Architecture Plan
 
 > Zero-dependency, type-safe, isomorphic feature flags for TypeScript. The
-> core engine targets **≤3 KB gzipped**; every source (JSON / env / remote)
+> core engine targets **≤3 KB gzipped**; every source (JSON / env /
+> remote), the extended-matcher set, the Standard-Schema validator bridge,
 > and every framework adapter (React, Next.js, SvelteKit, Vue, Hono,
 > Express, OpenFeature) lives behind its own subpath export and is pulled
 > in only when the consumer imports it. A Vercel Edge build using only the
 > in-code defaults source ships **~1.8 KB total**. Runs unmodified in
-> **Node 20+, Bun 1.0+, Deno 1.40+, Cloudflare Workers, Vercel Edge,
-> Netlify Edge**, the browser and React Native — through Web Standards
-> (`fetch`, `crypto.subtle` is **not** required; bucketing uses pure-JS
-> FNV-1a 32-bit, no Node-only APIs).
+> **Node 20+, Bun 1.0+, Deno 1.40+, Vercel Edge, Netlify Edge**, the
+> browser and React Native — through Web Standards (`fetch`,
+> `crypto.subtle` is **not** required; bucketing uses pure-JS FNV-1a
+> 32-bit, no Node-only APIs). **Cloudflare Workers** is supported with
+> one documented caveat: `setInterval`-based polling does not tick between
+> requests in the Workers runtime, so `createRemoteSource` rejects
+> `pollInterval` there and requires a Cron Trigger / Durable Object that
+> calls `flags.reload()` (see §2.8.3 / §9.21). The SSE fallback fetch-
+> stream parser uses `ReadableStream`, which React Native's polyfilled
+> `fetch` does not expose — RN consumers must stick to polling (see §9.22).
 >
 > Four flag value kinds (`boolean` / `string` / `number` / `JSON`),
 > percentage rollouts via consistent hashing (FNV-1a) over a stable
-> `(salt, flagKey, subjectId)` triple, targeting rules with `eq` / `in` /
-> `gt` / `gte` / `lt` / `lte` / `regex` / `exists` / `custom` matchers and
-> `AND` / `OR` / `NOT` composition, multi-environment overrides
+> `(salt, flagKey, subjectId)` triple, targeting rules with `eq` / `neq` /
+> `in` / `nin` / `exists` / `segment` matchers in core, plus optional
+> `gt` / `gte` / `lt` / `lte` / `regex` / `contains` / `startsWith` /
+> `endsWith` / `custom` from `@devkit/flags/matchers/extended`, with
+> `AND` / `OR` / `NOT` composition, named **segments** (reusable
+> `RuleGroup`s referenced by name), multi-environment overrides
 > (`dev` / `staging` / `prod` plus arbitrary user-defined names), pluggable
 > sources with priority composition, opt-in hot-reload (Node `fs.watch` for
 > JSON, polling or SSE for remote), and observability hooks
 > (`onEvaluation`) suitable for streaming evaluations into PostHog,
-> Mixpanel, Datadog or a homegrown analytics pipe.
+> Mixpanel, Datadog or a homegrown analytics pipe — with PII-safe
+> defaults (only `subject.id` forwarded; `redactSubject` to opt in to
+> attributes).
 >
 > Positioned to **fill the gap between DIY `process.env` and heavyweight
 > SaaS / self-hosted platforms**. `unleash-client` (315 k weekly) requires
@@ -124,12 +136,22 @@ devkit-flags/
 │   │   │                           # attributes (a missing key fails the
 │   │   │                           # match unless the operator is `exists`
 │   │   │                           # /`!exists`).
-│   │   ├── matchers.ts             # operator implementations: eq, neq, in,
-│   │   │                           # nin, gt, gte, lt, lte, regex, exists,
-│   │   │                           # contains, startsWith, endsWith, custom
-│   │   │                           # (function-form). Each matcher is a
-│   │   │                           # 1-2 line pure function so dead code
-│   │   │                           # elimination removes unused operators.
+│   │   ├── matchers.ts             # CORE operator set ONLY: eq, neq, in,
+│   │   │                           # nin, exists, segment. Each matcher
+│   │   │                           # is a 1-2 line pure function so dead
+│   │   │                           # code elimination removes unused
+│   │   │                           # operators. The rarer operators
+│   │   │                           # (gt/gte/lt/lte, regex, contains,
+│   │   │                           # startsWith, endsWith, custom) live
+│   │   │                           # under `src/matchers/extended/` and
+│   │   │                           # ship behind the
+│   │   │                           # `@devkit/flags/matchers/extended`
+│   │   │                           # subpath — opt-in, ~0.6 KB. The core
+│   │   │                           # rules walker (`rules.ts`) sees each
+│   │   │                           # matcher through a registry interface
+│   │   │                           # so unknown operators degrade to
+│   │   │                           # `false` (with `RULE_EVAL_ERROR`)
+│   │   │                           # rather than crashing.
 │   │   ├── bucket.ts               # bucketFor(salt, flagKey, subjectId,
 │   │   │                           #    percentage) → boolean
 │   │   │                           # plus variantBucketFor(...weights[]) →
@@ -232,6 +254,43 @@ devkit-flags/
 │   │                               # so an env override always beats a JSON
 │   │                               # value, and a remote update always
 │   │                               # beats both when present.
+│   │
+│   ├── matchers/
+│   │   └── extended/
+│   │       └── index.ts            # Opt-in extended matcher operators:
+│   │                               # gt, gte, lt, lte, regex, contains,
+│   │                               # startsWith, endsWith, custom. Each
+│   │                               # operator self-registers with the
+│   │                               # core matcher registry on import via
+│   │                               # `registerMatchers({...})` — a
+│   │                               # named, single-call effect that
+│   │                               # `sideEffects: false` whitelists.
+│   │                               # `regex` wraps every evaluation in
+│   │                               # a per-call execution budget plus a
+│   │                               # per-flag failure counter that
+│   │                               # auto-disables a misbehaving regex
+│   │                               # after N (default: 5) timeouts —
+│   │                               # tracked under
+│   │                               # FlagsError('REGEX_TIMEOUT' /
+│   │                               # 'REGEX_DISABLED'). `custom` is
+│   │                               # explicitly DOCUMENTED as in-code-
+│   │                               # only and is REJECTED at JSON parse
+│   │                               # time (see §2.8.1).
+│   │
+│   ├── validators/
+│   │   └── standard-schema/
+│   │       └── index.ts            # Optional Standard-Schema-V1 bridge
+│   │                               # for json-flag `schema` validation.
+│   │                               # Lives behind
+│   │                               # `@devkit/flags/validators/
+│   │                               # standard-schema` so consumers who
+│   │                               # don't ship Zod / Valibot / Arktype
+│   │                               # pay zero bytes for the duck-typed
+│   │                               # validate path. Core
+│   │                               # `JsonFlagSpec.schema` accepts the
+│   │                               # validator value but the actual
+│   │                               # `~standard.validate` invocation is
+│   │                               # gated through this subpath.
 │   │
 │   ├── adapters/
 │   │   ├── react/
@@ -407,9 +466,24 @@ devkit-flags/
 │   ├── types/
 │   │   └── inference.test-d.ts     # vitest --typecheck
 │   └── correctness/
-│       ├── rollout-stability.test.ts # bucket stability across reloads
-│       ├── salt-rotation.test.ts     # documented re-bucketing semantics
-│       └── concurrency.test.ts       # 1 k parallel reads on a hot reload
+│       ├── rollout-stability.test.ts    # bucket stability across reloads
+│       ├── salt-rotation.test.ts        # documented re-bucketing semantics
+│       ├── concurrency.test.ts          # 1 k parallel reads on a hot reload
+│       ├── json-matcher-safety.test.ts  # `custom` rejection +
+│       │                                # ReDoS-shaped regex sandboxing
+│       │                                # (UNSAFE_MATCHER_FROM_JSON +
+│       │                                # REGEX_TIMEOUT/REGEX_DISABLED)
+│       ├── env-allowlist.test.ts        # `createEnvSource` ignores
+│       │                                # collisions outside the schema-
+│       │                                # derived allowlist
+│       ├── workers-polling.test.ts      # `pollInterval` rejected on
+│       │                                # the Workers runtime; Cron-
+│       │                                # driven `reload()` works end-
+│       │                                # to-end
+│       └── analytics-only-rule.test.ts  # matched rule with no value
+│                                        # AND no rollout falls through
+│                                        # AND fires the observability
+│                                        # hook with the matched ruleId
 │
 └── examples/                       # not published — referenced from README
     ├── react-vite/
@@ -454,11 +528,42 @@ strips it from the published `.d.ts` rollup.
  * @typeParam TSchema  Inferred from the `flags` argument; do **not**
  *                     pass it manually — let TS infer the literal types
  *                     of every default value so `get()` can narrow.
+ * @typeParam TAttrs   Optional second generic that names + types the
+ *                     attribute keys consulted by targeting rules and
+ *                     `Subject.attributes`. When supplied, every rule's
+ *                     attribute-keyed `RuleGroup`, every `Subject.attributes`
+ *                     entry and every `EvaluationContext.overrides` typo
+ *                     becomes a compile-time error. Recommended for any
+ *                     non-trivial schema. Pass via the `attributes` field
+ *                     in `config` (see below) — TS infers the literal
+ *                     keys / types from there; users never write
+ *                     `defineFlags<S, A>(...)` manually.
  *
  * @param config.flags        The schema — a `Record<string, FlagSpec>`.
  *                            Each entry declares the flag's kind, default,
  *                            optional environment overrides, optional
  *                            targeting rules and optional rollout.
+ * @param config.attributes   Optional descriptor of the attribute keys
+ *                            and value-types every targeting rule may
+ *                            consult. The shape is
+ *                            `{ [attrName]: 'string' | 'number' |
+ *                            'boolean' | 'json' }` — no values, just a
+ *                            type map. This is the second-generic
+ *                            ergonomic entrypoint (see `TAttrs` above):
+ *                            the runtime ignores it; TypeScript uses it
+ *                            to narrow `Subject.attributes`,
+ *                            `RuleGroup` keys and `overrides` keys.
+ *                            Omit it and the library falls back to the
+ *                            permissive `Record<string, Json>` shape.
+ * @param config.segments     Optional named `RuleGroup`s. Reuse a
+ *                            segment via `{ segment: 'beta_users' }` in
+ *                            any `Rule.when`. Saves duplicating
+ *                            `{ plan: { in: ['pro','enterprise'] } }`
+ *                            across every rule. Cheap to add now;
+ *                            painful to retrofit. Names are typed:
+ *                            `keyof typeof config.segments` flows into
+ *                            the `segment` matcher's literal-string
+ *                            argument.
  * @param config.environment  Active environment. When omitted, resolves
  *                            via `process.env.NODE_ENV` →
  *                            `process.env.ENVIRONMENT` → `'production'`.
@@ -486,6 +591,15 @@ strips it from the published `.d.ts` rollup.
  *                            return). Errors thrown inside the hook are
  *                            caught and logged via `console.error`; they
  *                            never propagate to the caller.
+ * @param config.redactSubject
+ *                            Optional projection applied to `Subject`
+ *                            before it is forwarded to the observability
+ *                            hook and the built-in `toPostHog` /
+ *                            `toEndpoint` taps. Default behaviour is
+ *                            **PII-safe**: only `subject.id` is
+ *                            forwarded; `subject.attributes` is
+ *                            stripped. Pass `(s) => s` to opt back in
+ *                            to full attributes. See §2.10 / §9.23.
  *
  * @returns Frozen `FlagsHandle<TSchema>` exposing
  *          `.get(key, ctx?)`, `.getAll(ctx?)`, `.peek(key, ctx?)`,
@@ -559,9 +673,33 @@ strips it from the published `.d.ts` rollup.
  *     },
  *   });
  */
-export function defineFlags<TSchema extends FlagSchema>(
-  config: DefineFlagsConfig<TSchema>,
-): FlagsHandle<TSchema>;
+export function defineFlags<
+  TSchema extends FlagSchema,
+  TAttrs extends AttributeSchema = AttributeSchema,
+>(
+  config: DefineFlagsConfig<TSchema, TAttrs>,
+): FlagsHandle<TSchema, TAttrs>;
+```
+
+```ts
+/**
+ * Attribute-schema descriptor. Maps each named attribute to a primitive
+ * kind. Used as the second generic on `defineFlags` to narrow targeting,
+ * `Subject.attributes`, and `EvaluationContext.overrides`. Runtime cost:
+ * zero — the descriptor is purely a TS hint.
+ */
+export interface AttributeSchema {
+  readonly [key: string]: 'string' | 'number' | 'boolean' | 'json';
+}
+
+/** TS helper that maps an `AttributeSchema` to its runtime value type. */
+export type AttributesOf<TAttrs extends AttributeSchema> = {
+  readonly [K in keyof TAttrs]?:
+    TAttrs[K] extends 'string'  ? string
+    : TAttrs[K] extends 'number'  ? number
+    : TAttrs[K] extends 'boolean' ? boolean
+    : Json;
+};
 ```
 
 ```ts
@@ -614,6 +752,8 @@ export type {
   // Configuration
   DefineFlagsConfig,
   CreateFlagsConfig,
+  AttributeSchema,
+  AttributesOf,
   // Handle
   FlagsHandle,
   FlagsHandleConfig,
@@ -624,6 +764,7 @@ export type {
   FlagKind,
   FlagValueOf,
   FlagKeysOf,
+  FlagValuesOf,
   // Context
   EvaluationContext,
   Subject,
@@ -632,6 +773,7 @@ export type {
   RuleGroup,
   Matcher,
   Operator,
+  SegmentName,
   // Result
   EvaluationResult,
   EvaluationReason,
@@ -642,6 +784,7 @@ export type {
   // Observability
   OnEvaluation,
   EvaluationEvent,
+  RedactSubject,
   // Misc
   Environment,
   Json,
@@ -692,10 +835,13 @@ export interface EvaluationResult<TValue = unknown> {
   readonly source: 'defaults' | 'json' | 'env' | 'remote' | 'compose' | 'override';
   /**
    * `true` when the result is being served from a stale snapshot because
-   * a remote source failed its last refresh. Consumers can render
-   * "approximate" badges in dev tools.
+   * a remote source failed its last refresh, OR when a sync `get()` /
+   * `getDetail()` was called before the initial async load completed
+   * (the call returns the static default plus `stale: true` so consumers
+   * can render an "approximate" badge in dev tools, light up a Suspense
+   * boundary, or fan-out a one-time `await flags.ready()`).
    */
-  readonly degraded: boolean;
+  readonly stale: boolean;
 }
 
 /**
@@ -719,59 +865,143 @@ export type EvaluationReason =
 ```ts
 /**
  * The runtime handle returned by `defineFlags` / `createFlags`. The full
- * generic form (`FlagsHandle<TSchema>`) is what `defineFlags` returns;
- * `createFlags` returns the un-narrowed `FlagsHandle` (which is just
- * `FlagsHandle<FlagSchema>` — `get()` widens to `unknown`).
+ * generic form (`FlagsHandle<TSchema, TAttrs>`) is what `defineFlags`
+ * returns; `createFlags` returns the un-narrowed `FlagsHandle` (which is
+ * just `FlagsHandle<FlagSchema>` — `get()` widens to `unknown`).
+ *
+ * The handle exposes a **dual sync/async surface**:
+ *   - `get()` / `getAll()` / `getDetail()` are **synchronous**. They
+ *     read the current frozen snapshot. Until `ready()` resolves, they
+ *     evaluate against the in-code defaults (because that's the only
+ *     source that can resolve synchronously) and surface `stale: true`
+ *     so callers can opt into a Suspense boundary or a fallback render
+ *     without await ceremony in render hot paths. This is the API
+ *     React / Vue / Svelte components reach for.
+ *   - `getAsync()` / `getAllAsync()` / `getDetailAsync()` await the
+ *     initial async load (remote fetch, JSON-from-path) on the first
+ *     call. Once `ready()` resolves these become microtask-fast — but
+ *     they keep the explicit `Promise<T>` shape so RSC server
+ *     components, Next.js Route Handlers, and CLI tooling can `await`
+ *     idiomatically without `.unwrap()`-style escape hatches.
+ *
+ * The boot pattern is `await flags.ready()` once at startup; everything
+ * after is sync. This matches LaunchDarkly / Unleash / GrowthBook
+ * conventions and is the differentiator the original spec lost when it
+ * forced unconditional `Promise<T>`.
  */
-export interface FlagsHandle<TSchema extends FlagSchema = FlagSchema> {
+export interface FlagsHandle<
+  TSchema extends FlagSchema = FlagSchema,
+  TAttrs extends AttributeSchema = AttributeSchema,
+> {
   /**
-   * Resolve a flag's value. Returns the declared kind's value type:
-   *   `boolean` flag → `Promise<boolean>`
-   *   `number`  flag → `Promise<number>`
-   *   `string`  flag → `Promise<string>`     (or the union literal when
-   *                                           the spec declares `values`)
-   *   `json`    flag → `Promise<Json>`       (or the inferred shape when
-   *                                           the spec declares `schema`)
+   * Resolve a flag's value **synchronously** against the current frozen
+   * snapshot. Returns the declared kind's value type:
+   *   `boolean` flag → `boolean`
+   *   `number`  flag → `number`
+   *   `string`  flag → `string`               (or the union literal when
+   *                                            the spec declares `values`)
+   *   `json`    flag → `Json`                 (or the inferred shape when
+   *                                            the spec declares `schema`)
    *
-   * Why a `Promise` even though most lookups are synchronous? The first
-   * call may `await` the lazy initial fetch of every async source
-   * (remote / fs.read for JSON-from-path). Subsequent calls always
-   * resolve in the same microtask. We return `Promise` unconditionally
-   * to keep the public API monomorphic and so async sources are
-   * never an opt-in.
+   * Until `ready()` resolves, async sources have not loaded yet — `get()`
+   * falls back to the static default (or the call-site `defaultValue`
+   * argument when supplied) and the matching `getDetail()` would return
+   * `stale: true`. Component render paths, Express/Hono request handlers,
+   * and any other hot-path caller should use this overload — the
+   * synchronous-by-default ergonomics are exactly what `flagged` /
+   * LaunchDarkly's `variation()` / Unleash's `isEnabled()` ship.
    *
-   * Never throws. Failures degrade to the static default and emit
-   * `reason: 'ERROR'` through the observability hook.
+   * Never throws. Failures degrade to the static default (or the call-
+   * site `defaultValue`) and emit `reason: 'ERROR'` through the
+   * observability hook.
    *
-   * @param key     The flag key. Strongly typed against `TSchema`.
-   * @param context Optional evaluation context. When the same handle is
-   *                used across requests, the caller MUST pass a fresh
-   *                context per call so targeting + rollouts work — the
-   *                handle never caches the context.
+   * @param key          The flag key. Strongly typed against `TSchema`.
+   * @param context      Optional evaluation context. When the same handle
+   *                     is used across requests, the caller MUST pass a
+   *                     fresh context per call so targeting + rollouts
+   *                     work — the handle never caches the context.
+   * @param defaultValue Per-call default. Returned (instead of the
+   *                     schema's `default`) when the pipeline aborts
+   *                     with `reason: 'ERROR'` OR when the schema is
+   *                     stale and the call-site has a "kill switch
+   *                     under uncertainty" preference. Matches
+   *                     LaunchDarkly's `client.variation(k, u, fb)` and
+   *                     OpenFeature's `getXxxValue(k, fb)` signatures.
    */
   get<K extends FlagKeysOf<TSchema>>(
     key: K,
-    context?: EvaluationContext,
+    context?: EvaluationContext<TAttrs, TSchema>,
+  ): FlagValueOf<TSchema, K>;
+  get<K extends FlagKeysOf<TSchema>>(
+    key: K,
+    context: EvaluationContext<TAttrs, TSchema> | undefined,
+    defaultValue: FlagValueOf<TSchema, K>,
+  ): FlagValueOf<TSchema, K>;
+
+  /**
+   * `Promise`-returning sibling of `get()`. Awaits the initial async
+   * source load on first call (subsequent calls resolve in the same
+   * microtask via the cached snapshot). Use this in:
+   *   - Next.js App Router RSC server components
+   *   - Hono / Express handlers that already need to `await` upstream
+   *   - CLI tooling
+   *   - Any code path where the first-fetch latency is acceptable.
+   * Same `defaultValue` overload as `get()`.
+   */
+  getAsync<K extends FlagKeysOf<TSchema>>(
+    key: K,
+    context?: EvaluationContext<TAttrs, TSchema>,
+  ): Promise<FlagValueOf<TSchema, K>>;
+  getAsync<K extends FlagKeysOf<TSchema>>(
+    key: K,
+    context: EvaluationContext<TAttrs, TSchema> | undefined,
+    defaultValue: FlagValueOf<TSchema, K>,
   ): Promise<FlagValueOf<TSchema, K>>;
 
   /**
-   * Resolve every flag in the schema for a given context. Useful for
-   * SSR bootstrap payloads ("hydrate the React tree with all flags
-   * already evaluated"). Results are returned as a fresh frozen object;
-   * subsequent mutations to the handle do not affect already-returned
-   * snapshots.
+   * Resolve every flag in the schema for a given context **synchronously**
+   * against the current snapshot. Same `stale` semantics as `get()`.
+   * Useful for SSR bootstrap payloads ("hydrate the React tree with all
+   * flags already evaluated") AFTER `ready()` has resolved.
    */
-  getAll(context?: EvaluationContext): Promise<FlagValuesOf<TSchema>>;
+  getAll(context?: EvaluationContext<TAttrs, TSchema>): FlagValuesOf<TSchema>;
+
+  /** `Promise`-returning sibling of `getAll()`. */
+  getAllAsync(context?: EvaluationContext<TAttrs, TSchema>): Promise<FlagValuesOf<TSchema>>;
 
   /**
-   * Same as `get()` but returns the full `EvaluationResult` rather than
-   * the bare value. Use this when you need `reason` / `ruleId` / `bucket`
-   * for dashboards or debugging.
+   * Synchronous detailed evaluation. Returns the full `EvaluationResult`
+   * (reason, ruleId, bucket, source, stale) rather than the bare value.
+   * Replaces the previous-spec `peek()` — the rename pairs the method
+   * with `get()` (`get` ↔ `getDetail`) and removes the misleading
+   * "side-effect-free" connotation of "peek" (this method DOES fire the
+   * `onEvaluation` hook). Use it for dashboards, debug toolbars, and
+   * `flag-result` headers.
    */
-  peek<K extends FlagKeysOf<TSchema>>(
+  getDetail<K extends FlagKeysOf<TSchema>>(
     key: K,
-    context?: EvaluationContext,
+    context?: EvaluationContext<TAttrs, TSchema>,
+  ): EvaluationResult<FlagValueOf<TSchema, K>>;
+
+  /** `Promise`-returning sibling of `getDetail()`. */
+  getDetailAsync<K extends FlagKeysOf<TSchema>>(
+    key: K,
+    context?: EvaluationContext<TAttrs, TSchema>,
   ): Promise<EvaluationResult<FlagValueOf<TSchema, K>>>;
+
+  /**
+   * Resolves once every async source has completed its initial load
+   * (or fail-open'd). Boot pattern:
+   *
+   *     await flags.ready();
+   *     server.listen(3000);
+   *
+   * Idempotent — calling twice returns the same Promise. After the
+   * first resolve, subsequent calls resolve synchronously on the next
+   * microtask. `reload()` does NOT reset `ready()`; once the handle is
+   * ready it stays ready until `dispose()`.
+   */
+  ready(): Promise<void>;
 
   /**
    * Subscribe to source changes (file watch / remote poll / SSE).
@@ -784,7 +1014,9 @@ export interface FlagsHandle<TSchema extends FlagSchema = FlagSchema> {
   /**
    * Force a refresh of every async source. Returns the new snapshot.
    * Common use cases: a webhook from your config service, a manual
-   * "refresh" button in admin tooling, a test harness.
+   * "refresh" button in admin tooling, a test harness, a Cloudflare
+   * Workers Cron Trigger that pulls remote config (since `setInterval`
+   * does not tick between requests on Workers — see §2.8.3 / §9.21).
    */
   reload(): Promise<FlagSourceSnapshot>;
 
@@ -821,13 +1053,24 @@ export type FlagsListener = (snapshot: FlagSourceSnapshot) => void;
  * a fresh one per evaluation — the handle is **stateless** with respect
  * to context. Anonymous reads (no subject) skip rollouts entirely; this
  * is by design — see §9.3.
+ *
+ * Both generics default to permissive shapes so consumers who skip the
+ * second `defineFlags` generic still get a working type. When `TAttrs` /
+ * `TSchema` ARE supplied, every field below narrows: `subject.attributes`
+ * is keyed by `keyof TAttrs`, `overrides` is keyed by `keyof TSchema`,
+ * and a typo (`palan`, `newChckout`) becomes a TypeScript error at the
+ * call-site rather than a silent runtime miss. This is the differentiator
+ * the previous spec lost when both fields were typed `Record<string, …>`.
  */
-export interface EvaluationContext {
+export interface EvaluationContext<
+  TAttrs extends AttributeSchema = AttributeSchema,
+  TSchema extends FlagSchema = FlagSchema,
+> {
   /**
    * The user/account/tenant the evaluation is for. The `id` is the only
    * required field; everything else is for targeting rules.
    */
-  subject?: Subject;
+  subject?: Subject<TAttrs>;
   /**
    * Override the active environment for this single call. Tests use this
    * to assert per-environment behaviour without instantiating multiple
@@ -835,15 +1078,17 @@ export interface EvaluationContext {
    */
   environment?: Environment;
   /**
-   * Per-call overrides. The most common use is `{ flagKey: value }` in
-   * tests; the override skips every other rule and surfaces
-   * `reason: 'OVERRIDE'`. Production code should rely on environment
-   * overrides instead.
+   * Per-call overrides keyed by flag key, with the value typed against
+   * the flag's declared `kind`. The most common use is
+   * `{ newCheckout: true }` in tests; the override skips every other
+   * rule and surfaces `reason: 'OVERRIDE'`. Production code should rely
+   * on environment overrides instead. A typo (`newChckout: true`)
+   * becomes a TypeScript error.
    */
-  overrides?: Record<string, unknown>;
+  overrides?: Partial<FlagValuesOf<TSchema>>;
 }
 
-export interface Subject {
+export interface Subject<TAttrs extends AttributeSchema = AttributeSchema> {
   /**
    * Stable identifier — user ID, tenant ID, anonymous-cookie-ID. The
    * value drives rollout bucketing; rotating it across requests for the
@@ -852,12 +1097,16 @@ export interface Subject {
    */
   id: string;
   /**
-   * Free-form attributes consulted by targeting rules. Matchers receive
+   * Attributes consulted by targeting rules. When the consumer supplied
+   * `config.attributes` to `defineFlags`, the keys + value-types narrow
+   * to `AttributesOf<TAttrs>` and a typo at the call-site is a
+   * compile-time error. When `config.attributes` is omitted, falls back
+   * to the permissive `Record<string, Json>` shape. Matchers receive
    * `attributes[op.attr]`; missing attributes always *fail* the match
    * (with the documented exception of `exists`). Values must be
    * `Jsonable` — primitives, arrays, plain objects.
    */
-  attributes?: Record<string, Json>;
+  attributes?: AttributesOf<TAttrs>;
 }
 ```
 
@@ -974,20 +1223,56 @@ export interface Rule<TValue = unknown> {
 
 /**
  * Boolean composition of matchers. The default is implicit-AND when an
- * object map is given; explicit `$and` / `$or` / `$not` keys nest.
+ * object map is given; explicit `$and` / `$or` / `$not` keys nest. The
+ * `{ $segment: 'name' }` form references a named `RuleGroup` declared
+ * in `config.segments` — saves duplicating
+ * `{ plan: { in: ['pro','enterprise'] } }` across every rule.
  */
-export type RuleGroup =
-  | { readonly $and: readonly RuleGroup[] }
-  | { readonly $or: readonly RuleGroup[] }
-  | { readonly $not: RuleGroup }
-  | Readonly<Record<string, Matcher>>;  // implicit AND across attrs
+export type RuleGroup<
+  TAttrs extends AttributeSchema = AttributeSchema,
+  TSegments extends string = string,
+> =
+  | { readonly $and: readonly RuleGroup<TAttrs, TSegments>[] }
+  | { readonly $or: readonly RuleGroup<TAttrs, TSegments>[] }
+  | { readonly $not: RuleGroup<TAttrs, TSegments> }
+  | { readonly $segment: TSegments }
+  | { readonly [K in keyof TAttrs]?: Matcher };
 
-/** A single attribute matcher. Operators see attribute by key. */
+/**
+ * A single attribute matcher. Operators see attribute by key.
+ *
+ * **Core matchers** (always available, ship in the 3 KB core):
+ *   `eq`, `neq`, `in`, `nin`, `exists`.
+ *
+ * **Extended matchers** (opt-in via `import '@devkit/flags/matchers/extended'`,
+ * adds ~0.6 KB):
+ *   `gt`, `gte`, `lt`, `lte`, `contains`, `startsWith`, `endsWith`,
+ *   `regex`, `custom`.
+ *
+ * **`custom` is in-code-only and CANNOT appear in JSON / remote sources.**
+ * `parseFlagsJson` rejects any rule whose matcher discriminant is
+ * `custom` with `FlagsError('UNSAFE_MATCHER_FROM_JSON')`. The
+ * `(value: Json | undefined) => boolean` callback shape is unrepresentable
+ * in JSON anyway; the explicit reject is a defence-in-depth guard
+ * against a future "function-string" loader being bolted on. See §2.8.1.
+ *
+ * **`regex` is wrapped in a per-evaluation budget** — every invocation
+ * runs under a documented timeout (default 50 ms via `setImmediate`-based
+ * cooperative budget). After N consecutive timeouts on the same
+ * `(flagKey, regex)` pair (default 5), that pattern is auto-disabled and
+ * subsequent matches return `false`. Both events are reported through
+ * the observability hook with `code: 'REGEX_TIMEOUT'` /
+ * `'REGEX_DISABLED'`. This neuters ReDoS attacks shipped from a
+ * compromised CDN. See §5.2 / §9.24.
+ */
 export type Matcher =
+  // Core — always present
   | { readonly eq: Json }
   | { readonly neq: Json }
   | { readonly in: readonly Json[] }
   | { readonly nin: readonly Json[] }
+  | { readonly exists: boolean }
+  // Extended — opt-in via `@devkit/flags/matchers/extended`
   | { readonly gt: number | string }
   | { readonly gte: number | string }
   | { readonly lt: number | string }
@@ -996,14 +1281,22 @@ export type Matcher =
   | { readonly contains: string }
   | { readonly startsWith: string }
   | { readonly endsWith: string }
-  | { readonly exists: boolean }
+  /**
+   * In-code-only escape hatch. Hard-rejected by JSON/remote loaders
+   * (see `UNSAFE_MATCHER_FROM_JSON`). When the callback throws, the
+   * match is treated as `false` and a `RULE_EVAL_ERROR` is emitted.
+   * @internal-loader-rejected
+   */
   | { readonly custom: (value: Json | undefined) => boolean };
 
 export type Operator =
-  | 'eq' | 'neq' | 'in' | 'nin'
-  | 'gt' | 'gte' | 'lt' | 'lte'
-  | 'regex' | 'contains' | 'startsWith' | 'endsWith'
-  | 'exists' | 'custom';
+  | 'eq' | 'neq' | 'in' | 'nin' | 'exists'                // core
+  | 'gt' | 'gte' | 'lt' | 'lte'                            // extended
+  | 'regex' | 'contains' | 'startsWith' | 'endsWith'       // extended
+  | 'custom';                                              // extended, in-code only
+
+/** Type-level segment-name handle — flows from `config.segments`. */
+export type SegmentName<TSegments extends string = string> = TSegments;
 ```
 
 ### 2.7 Rollouts
@@ -1014,15 +1307,21 @@ export type Operator =
  * 0..N enables, the rest disables (for boolean flags) or returns the
  * spec's default (for value flags).
  *
- * For string flags with `values: ['a','b','c']`, a multivariate rollout
- * is `{ variants: { a: 50, b: 30, c: 20 } }`; weights MUST sum to 100.
+ * For string flags with `values: ['a','b','c'] as const`, a multivariate
+ * rollout's `variants` keys are typed `Partial<Record<TValues, number>>`
+ * — TypeScript rejects `{ variants: { c: 100 } }` against
+ * `values: ['a','b'] as const` at compile time. Weights MUST sum to 100;
+ * config-time normalisation throws `INVALID_SCHEMA` when they don't (see
+ * §9.7) AND a future-TS arithmetic check (number-tuple sum) emits a
+ * lint warning when the literal weights provably miss 100. Authors get
+ * both a static and a runtime guard rail.
  *
  * Bucketing is deterministic: `bucket = FNV-1a(salt + flagKey + subjectId) % 10000`.
  * Increasing `percentage` from 25 → 50 means every subject already in the
  * 25 % segment stays in (their bucket didn't move). Rotating the salt
  * reshuffles every subject — see §9.4.
  */
-export type Rollout<TValue = unknown> =
+export type Rollout<TValues = unknown, TAttrs extends AttributeSchema = AttributeSchema> =
   | {
       /** Inclusive percent in `[0, 100]`. `100` = always-on. */
       readonly percentage: number;
@@ -1031,12 +1330,19 @@ export type Rollout<TValue = unknown> =
        * Useful when a rule wants to bucket by, e.g., `tenantId` instead
        * of the user's `id`.
        */
-      readonly subjectId?: (ctx: EvaluationContext) => string;
+      readonly subjectId?: (ctx: EvaluationContext<TAttrs>) => string;
     }
   | {
-      /** Multivariate rollout: each variant's weight is its percentage. */
-      readonly variants: Readonly<Record<string, number>>;
-      readonly subjectId?: (ctx: EvaluationContext) => string;
+      /**
+       * Multivariate rollout: each variant's weight is its percentage.
+       * Keys are constrained to the spec's declared `values` union when
+       * `TValues` is a string-literal union — typo `c` against
+       * `values: ['a', 'b']` is a compile-time error.
+       */
+      readonly variants: TValues extends string
+        ? Partial<Record<TValues, number>>
+        : Readonly<Record<string, number>>;
+      readonly subjectId?: (ctx: EvaluationContext<TAttrs>) => string;
     };
 ```
 
@@ -1088,6 +1394,8 @@ export interface FlagsJson {
   $schema?: string; // optional reference to our published JSON schema
   flags: Record<string, FlagJsonEntry>;
   environments?: string[];
+  /** Named segments — referenced from rules via `{ $segment: 'name' }`. */
+  segments?: Record<string, RuleGroupJson>;
 }
 
 export type FlagJsonEntry =
@@ -1096,6 +1404,48 @@ export type FlagJsonEntry =
   | { kind: 'number';  default: number;  range?: [number, number]; environments?: Record<string, number>; rules?: RuleJson[]; rollout?: RolloutJson; tags?: string[]; deprecated?: boolean; description?: string }
   | { kind: 'json';    default: Json;    environments?: Record<string, Json>; rules?: RuleJson[]; rollout?: RolloutJson; tags?: string[]; deprecated?: boolean; description?: string };
 ```
+
+#### 2.8.1.1 Security: matcher restrictions on JSON-loaded rules
+
+`parseFlagsJson` is the **trust boundary** between code-reviewed schema
+and untrusted CDN / remote payloads. The parser enforces three
+restrictions; every violation rejects the whole payload and returns
+`FlagsError` so the previous snapshot keeps serving traffic:
+
+1. **`custom` matchers are hard-rejected.** Any rule whose matcher
+   discriminant is `custom` causes `FlagsError('UNSAFE_MATCHER_FROM_JSON')`
+   with a JSON pointer to the offending node. The `(value) => boolean`
+   callback shape is unrepresentable in JSON, but a future "function-
+   string-via-eval" loader bolted on by a contributor would silently
+   open an RCE channel; the explicit reject pre-empts that vector.
+   `JsonRuleMatcher` (the runtime parse type) **omits** `custom` from
+   its discriminant union to make the rejection a type-system property
+   rather than a runtime check. Tested in
+   `test/correctness/json-matcher-safety.test.ts`.
+
+2. **`regex` matchers are sandboxed.** Every regex from a JSON / remote
+   source is compiled with the user's `flags` string AND wrapped in the
+   per-evaluation budget described in §2.6 / §9.24. A pattern that
+   exhibits catastrophic backtracking (`(a+)+$`, `(.*a){11,}$`) can
+   tear the request thread to >100 % CPU on a vulnerable runtime; the
+   budget caps a single match and the failure counter
+   auto-disables a misbehaving pattern. `parseFlagsJson` additionally
+   rejects regex literals longer than 1 024 chars and patterns that
+   contain `(?<...>)` lookbehind nesting deeper than 3 (a cheap
+   structural ReDoS heuristic) with `INVALID_SCHEMA`. None of this is
+   a substitute for not loading regex from untrusted endpoints — it is
+   defence-in-depth for the case where a CDN goes hostile.
+
+3. **`segments` references must resolve.** Every `{ $segment: 'name' }`
+   matcher has its `name` checked against the top-level `segments` map
+   at parse time; an unresolved reference is `INVALID_SCHEMA`.
+
+These guards live **in the JSON parser**, not in the rules walker —
+once a rule is in the snapshot it is trusted. The dist artifact for
+`@devkit/flags/sources/json` reflects this overhead in the 0.7 KB
+budget. CI gate: `test/correctness/json-matcher-safety.test.ts` covers
+the `UNSAFE_MATCHER_FROM_JSON`, regex-too-long, and unresolved-segment
+paths.
 
 #### 2.8.2 `@devkit/flags/sources/env`
 
@@ -1140,6 +1490,27 @@ export function createEnvSource(opts?: {
   env?: Record<string, string | undefined>;
   /** Override the camelCase → SCREAMING_SNAKE transform. */
   toEnvVarName?: (flagKey: string) => string;
+  /**
+   * **Allowlist of flag keys that may be overridden by env-vars.**
+   *
+   * Default: derived from the schema — only env-vars whose names map
+   * back to a declared flag are read. This is the safe default: an
+   * unrelated `FLAG_INTERNAL_DEBUG_TOKEN` env-var that happens to share
+   * the prefix is **ignored** by the source rather than leaking into
+   * the snapshot (and from there, into the observability hook).
+   *
+   * Pass an explicit array to narrow further (`['newCheckout']`), or
+   * `'*'` to opt back in to "read every `${prefix}*` env-var" — useful
+   * for `createFlags` consumers who build the schema dynamically and
+   * would otherwise hit a bootstrap chicken-and-egg.
+   *
+   * When `allow` is the schema-derived default and an env-var matches
+   * the prefix but no flag, the source emits a one-time
+   * `console.warn` ("FLAG_NEW_CHECKOUTS=true matches the FLAG_ prefix
+   * but no declared flag — typo?") so the consumer notices the
+   * accidental collision rather than silently dropping the override.
+   */
+  allow?: readonly string[] | '*';
 }): FlagSource;
 ```
 
@@ -1167,9 +1538,31 @@ export function createEnvSource(opts?: {
 export function createRemoteSource(
   url: string | URL,
   opts?: {
-    /** Polling cadence; ignored when `transport === 'sse'`. Default: `60_000`. */
+    /**
+     * Polling cadence; ignored when `transport === 'sse'`. Default: `60_000`.
+     *
+     * **Cloudflare Workers caveat.** The Workers runtime does NOT run a
+     * background event loop between requests; `setInterval` callbacks
+     * only fire while a request is being handled. Setting `pollInterval`
+     * on a Workers-detected runtime throws `FlagsError(
+     * 'INVALID_RUNTIME_OPTION')` at construction with a message pointing
+     * to the documented Cron Trigger / Durable Object pattern: an
+     * external scheduler (Cron Trigger, Queue consumer, or Durable Object
+     * `alarm()`) must call `flags.reload()` itself. The handle's
+     * synchronous `get()` API was specifically designed so a Worker can
+     * read the cached snapshot in the request fast-path with zero
+     * `await` ceremony. See §9.21 for the full pattern.
+     */
     pollInterval?: number;
-    /** `'poll'` (default) or `'sse'`. */
+    /**
+     * `'poll'` (default) or `'sse'`.
+     *
+     * **React Native caveat.** RN's polyfilled `fetch` does NOT expose
+     * `ReadableStream` on its `Response.body`, so the SSE fallback
+     * fetch-stream parser cannot decode events. `'sse'` is rejected at
+     * construction on RN with `INVALID_RUNTIME_OPTION` and a message
+     * pointing the consumer at `'poll'`. See §9.22.
+     */
     transport?: 'poll' | 'sse';
     /** Custom `fetch` (e.g. wrapped with auth). Default: `globalThis.fetch`. */
     fetch?: typeof fetch;
@@ -1185,9 +1578,52 @@ export function createRemoteSource(
     requestTimeoutMs?: number;
     /** Back-off for transient errors. Default: exponential, base 1s, cap 30s. */
     backoff?: BackoffStrategy;
+    /**
+     * Whether the initial fetch failure resolves successfully against
+     * the static defaults (`true`, default) or rejects the
+     * `flags.ready()` promise (`false`). Used by §9.8.
+     */
+    failOpen?: boolean;
   },
 ): FlagSource;
 ```
+
+> **Workers Cron Trigger / Durable Object refresh pattern**
+>
+> Because `pollInterval` is rejected on the Workers runtime, the
+> recommended pattern is:
+>
+> ```ts
+> // wrangler.toml — schedule every 60 s
+> // [triggers]
+> // crons = ["* * * * *"]
+>
+> import { defineFlags } from '@devkit/flags';
+> import { createRemoteSource } from '@devkit/flags/sources/remote';
+>
+> const flags = defineFlags({
+>   flags: { /* ... */ },
+>   sources: [
+>     createRemoteSource(REMOTE_URL, {
+>       // pollInterval omitted; Cron Trigger drives reloads
+>       requestTimeoutMs: 3_000,
+>     }),
+>   ],
+> });
+>
+> export default {
+>   async fetch(req, env, ctx) {
+>     const v = flags.get('newCheckout');     // sync, reads last snapshot
+>     return Response.json({ v });
+>   },
+>   async scheduled(event, env, ctx) {
+>     ctx.waitUntil(flags.reload());           // refresh on every cron tick
+>   },
+> };
+> ```
+>
+> A Durable Object `alarm()` is the alternative when the consumer
+> needs sub-minute cadence or per-tenant intervals.
 
 #### 2.8.4 `@devkit/flags/sources/compose`
 
@@ -1228,13 +1664,94 @@ core types; consumers import shared types from the root `@devkit/flags`.
 ```ts
 /**
  * React adapter — provider + hooks. SSR-safe via `useSyncExternalStore`;
- * concurrent-mode safe; works in RSC client components.
+ * concurrent-mode safe; works in RSC client components. Hooks read
+ * **synchronously** from the handle's snapshot (the dual sync/async
+ * surface introduced in §2.3 means render paths never await — the
+ * `flagged`/LaunchDarkly DX trade-off the previous spec lost is
+ * recovered here).
+ *
+ * Two ways to import the hooks:
+ *
+ * 1. **Stringly-typed (default)** — `useFlag('newCheckout')`. Returns
+ *    `FlagValueOf<S, K>` only when the consumer threads the schema
+ *    via a `declare module` ambient or codegen. Without that, the
+ *    return type widens to `boolean | string | number | Json`.
+ *
+ * 2. **Bindings factory (recommended)** — `createReactBindings(handle)`
+ *    returns a `{ FlagsProvider, useFlag, useFlagResult, useFlags,
+ *    Flag }` object whose hooks are pre-narrowed to the handle's
+ *    `TSchema` / `TAttrs` generics. No `declare module` ambient, no
+ *    codegen step — the same trick `tRPC`'s
+ *    `createTRPCReact<AppRouter>()` uses. This is the canonical
+ *    pattern in the README and what every example app reaches for.
+ *
+ * Both surfaces ship in the same 0.7 KB subpath bundle — the factory
+ * is a 6-LOC closure, the stringly-typed exports are wrappers around
+ * it.
  */
-export function FlagsProvider<S extends FlagSchema>(props: {
-  flags: FlagsHandle<S>;
-  /** Per-render evaluation context. Memoise upstream to avoid resub. */
-  context?: EvaluationContext;
-  /** Optional initial snapshot for SSR hydration. */
+
+/**
+ * Bindings factory. Returns React primitives bound to the supplied
+ * handle's generics — every hook narrows `key` against
+ * `FlagKeysOf<S>` and the return value against `FlagValueOf<S, K>`
+ * with zero ambient-module tax.
+ *
+ * @example
+ *   // src/flags.ts
+ *   import { defineFlags } from '@devkit/flags';
+ *   import { createReactBindings } from '@devkit/flags/adapters/react';
+ *
+ *   export const flags = defineFlags({
+ *     flags: {
+ *       newCheckout: { kind: 'boolean', default: false },
+ *       variant:     { kind: 'string', default: 'a',
+ *                      values: ['a','b','c'] as const },
+ *     },
+ *   });
+ *
+ *   export const {
+ *     FlagsProvider,
+ *     useFlag,
+ *     useFlagResult,
+ *     useFlags,
+ *     Flag,
+ *   } = createReactBindings(flags);
+ *
+ *   // src/component.tsx
+ *   import { useFlag } from './flags';
+ *   const variant = useFlag('variant');
+ *   //    ^? const variant: 'a' | 'b' | 'c'
+ */
+export function createReactBindings<
+  S extends FlagSchema,
+  A extends AttributeSchema,
+>(
+  handle: FlagsHandle<S, A>,
+): {
+  FlagsProvider: (props: {
+    /** Per-render evaluation context. Memoise upstream to avoid resub. */
+    context?: EvaluationContext<A, S>;
+    /** Optional initial snapshot for SSR hydration. */
+    initialSnapshot?: FlagSourceSnapshot;
+    children: React.ReactNode;
+  }) => JSX.Element;
+  useFlag: <K extends FlagKeysOf<S>>(key: K, fallback?: FlagValueOf<S, K>) => FlagValueOf<S, K>;
+  useFlagResult: <K extends FlagKeysOf<S>>(key: K) => EvaluationResult<FlagValueOf<S, K>>;
+  useFlags: () => FlagValuesOf<S>;
+  Flag: <K extends FlagKeysOf<S>>(props: {
+    name: K;
+    children: FlagValueOf<S, K> | ((value: FlagValueOf<S, K>) => React.ReactNode);
+    fallback?: React.ReactNode;
+  }) => JSX.Element;
+};
+
+/**
+ * Stringly-typed escape hatch — prefer `createReactBindings(handle)` in
+ * new code. SSR-safe via `useSyncExternalStore`; concurrent-mode safe.
+ */
+export function FlagsProvider<S extends FlagSchema, A extends AttributeSchema>(props: {
+  flags: FlagsHandle<S, A>;
+  context?: EvaluationContext<A, S>;
   initialSnapshot?: FlagSourceSnapshot;
   children: React.ReactNode;
 }): JSX.Element;
@@ -1346,28 +1863,86 @@ export function createOpenFeatureProvider<S extends FlagSchema>(
 
 ```ts
 /**
- * Hook signature. Fires once per `get()` / `peek()` call (after
- * coercion, before the public Promise resolves). Errors thrown inside
- * the hook are caught + console.error'd; they NEVER propagate.
+ * Hook signature. Fires once per `get()` / `getDetail()` /
+ * `getAsync()` / `getDetailAsync()` call (after coercion, before the
+ * value is returned to the caller). Errors thrown inside the hook are
+ * caught + console.error'd with `code: 'OBSERVABILITY_HOOK_ERROR'`;
+ * they NEVER propagate.
  */
 export type OnEvaluation = (event: EvaluationEvent) => void | Promise<void>;
 
+/**
+ * The payload forwarded to every `OnEvaluation` hook AND to the
+ * built-in `toPostHog` / `toEndpoint` taps.
+ *
+ * **`subject` is PII-safe by default.** It contains only `subject.id`
+ * (which is already a stable opaque identifier — `distinctId` in
+ * PostHog terminology, suitable for analytics) and OMITS
+ * `subject.attributes`. Forwarding the full attribute bag could leak
+ * email, plan, IP, country, custom fields — for payments / auth
+ * users that's GDPR-relevant straight up. To opt back in (e.g. for an
+ * internal product-engineering dashboard where the consumer has
+ * already DPA-cleared the attributes), pass
+ * `redactSubject: (s) => s` to `defineFlags` (see §2.1). The handle
+ * runs the redactor once before fan-out; user hooks always see the
+ * redacted shape. Built-in taps additionally STRIP any field other
+ * than `id` from the redactor's output as a belt-and-braces layer.
+ *
+ * See README's `eu-residency.md` snippet for the GDPR cookbook.
+ */
 export interface EvaluationEvent {
   readonly flagKey: string;
   readonly value: unknown;
   readonly reason: EvaluationReason;
   readonly ruleId?: string;
   readonly bucket?: number;
-  readonly subject?: Subject;
+  /**
+   * Only `id` by default. Full `Subject` (including `attributes`)
+   * when the consumer passed `redactSubject: (s) => s` to
+   * `defineFlags`. Hook authors should treat any non-`id` field as
+   * opt-in PII.
+   */
+  readonly subject?: Pick<Subject, 'id'> | Subject;
   readonly environment: string;
   readonly elapsedMs: number; // measured between dispatch and resolve
   readonly timestamp: number; // Date.now() at resolve
 }
 
+/**
+ * The redactor signature. `defineFlags({ redactSubject })` accepts a
+ * function that receives the full `Subject` and returns the projection
+ * forwarded to hooks + taps.
+ *
+ *   default: (s) => ({ id: s.id })       // PII-safe
+ *   opt-in:  (s) => s                    // forward attributes too
+ *   custom:  (s) => ({ id: s.id, plan: s.attributes?.plan })
+ */
+export type RedactSubject = (subject: Subject) => Partial<Subject>;
+
 /** Pre-built taps for popular analytics platforms. */
 export function toConsole(level?: 'log' | 'debug' | 'info'): OnEvaluation;
+/**
+ * PostHog tap. Forwards `subject.id` as `distinctId` and the public
+ * fields of `EvaluationEvent` as `properties`. Does NOT forward
+ * `subject.attributes` even when the redactor opts back in — PostHog
+ * already stores user properties out of band; flag-evaluation events
+ * should not duplicate them.
+ */
 export function toPostHog(client: { capture: (e: { event: string; properties: Record<string, unknown>; distinctId?: string }) => void }): OnEvaluation;
-export function toEndpoint(url: string, opts?: { batchSize?: number; flushIntervalMs?: number; fetch?: typeof fetch }): OnEvaluation;
+/**
+ * Generic POST-to-URL batching tap. Same id-only default as PostHog;
+ * pass `forwardAttributes: true` to override (the consumer takes
+ * responsibility for the GDPR posture of their own endpoint).
+ */
+export function toEndpoint(
+  url: string,
+  opts?: {
+    batchSize?: number;
+    flushIntervalMs?: number;
+    fetch?: typeof fetch;
+    forwardAttributes?: boolean;
+  },
+): OnEvaluation;
 ```
 
 ### 2.11 CLI
@@ -1464,6 +2039,22 @@ function evaluateFlag(
     for (const rule of spec.rules) {
       if (rule.when && !matchRule(rule.when, context)) continue;
       // matched
+
+      // 2a. analytics-only rule: matched, but neither value nor rollout.
+      // Fire the observability hook with reason 'TARGETING_MATCH' and
+      // ruleId so dashboards can count exposures, then FALL THROUGH —
+      // the rule purposefully observes a segment without overriding
+      // the value. (§2.6 Rule.value / Rule.rollout: "If neither is
+      // supplied the rule is a no-op (fires but returns the default),
+      // useful for analytics-only rules that just observe a segment."
+      // The previous-spec pseudocode skipped this branch — REGRESSION
+      // TEST: `test/core/evaluate.test.ts` "matched analytics-only rule
+      // continues walking".)
+      if (rule.value === undefined && rule.rollout === undefined) {
+        recordExposure(spec.key, rule.id);
+        continue;
+      }
+
       if (rule.rollout) {
         const decision = bucketFor(config.salt, spec.key + ':' + rule.id, ...);
         if (decision.included) {
@@ -1475,7 +2066,7 @@ function evaluateFlag(
         return finalize(rule.value, 'TARGETING_MATCH', ..., rule.id);
       }
     }
-    // rules existed but none matched
+    // rules existed but none matched (or all were analytics-only)
     if (envValue !== undefined) return finalize(envValue, 'ENVIRONMENT', ...);
     if (spec.rollout)            return applyRollout(spec.rollout, ...);
     return finalize(spec.default, 'TARGETING_FALLBACK', ...);
@@ -1583,14 +2174,27 @@ export type FlagSchema = Record<string, FlagSpec>;
 // literal, TS infers each entry's `kind` as the literal `'boolean'`
 // (NOT widened to `string`) and each `default` as the literal value
 // (NOT widened to `boolean`). The DefineFlagsConfig generic propagates
-// that literal information through.
-export interface DefineFlagsConfig<TSchema extends FlagSchema> {
+// that literal information through. The second `TAttrs` generic is
+// inferred from the `attributes` field (also literal-typed) so the
+// derived `Subject.attributes`, `RuleGroup` keys, and `overrides`
+// shapes all narrow without any `as const` ceremony beyond the
+// existing one for `string`-flag `values`.
+export interface DefineFlagsConfig<
+  TSchema extends FlagSchema,
+  TAttrs extends AttributeSchema = AttributeSchema,
+> {
   flags: TSchema;
+  /** Optional attribute-shape descriptor. See §2.1 / `AttributeSchema`. */
+  attributes?: TAttrs;
+  /** Optional named segments — referenced via `{ $segment: 'name' }`. */
+  segments?: Readonly<Record<string, RuleGroup<TAttrs>>>;
   environment?: Environment;
   sources?: readonly FlagSource[];
-  subjectId?: (ctx: EvaluationContext) => string;
+  subjectId?: (ctx: EvaluationContext<TAttrs, TSchema>) => string;
   salt?: string;
   onEvaluation?: OnEvaluation;
+  /** Project a `Subject` before forwarding to hooks. Default = id-only. */
+  redactSubject?: RedactSubject;
 }
 
 // The big mapped-type: given a FlagSpec, produce its declared value type.
@@ -1660,22 +2264,29 @@ output type drives `FlagValueOf` automatically.
 
 ### 4.4 Generic propagation through adapters
 
-Every adapter accepts `FlagsHandle<S>` generically and threads `S` into
-its hooks / middleware:
+Every adapter accepts `FlagsHandle<S, A>` generically and threads `S`
+(and `A`, when relevant) into its hooks / middleware. **The recommended
+ergonomic pattern is the bindings factory** (§2.9.1) — `tRPC` proved
+it's the cleanest way to bind a typed handle to React without a
+`declare module` ambient or a codegen step:
 
 ```ts
-const flags = defineFlags({ /* ... */ });
+// src/flags.ts
+export const flags = defineFlags({ /* ... */ });
+export const { FlagsProvider, useFlag, useFlagResult, useFlags, Flag } =
+  createReactBindings(flags);
 
-function MyComponent() {
-  const v = useFlag<typeof flags extends FlagsHandle<infer S> ? S : never, 'newCheckout'>('newCheckout');
-  //    ^? const v: boolean
-}
+// src/component.tsx
+import { useFlag } from './flags';
+const v = useFlag('newCheckout');
+//    ^? const v: boolean
 ```
 
-In practice the user writes `useFlag('newCheckout')` and a tiny
-`declare module` ambient (or the codegen output) re-types
-`useFlag<K>(key: K)` against the literal schema, so the verbose
-`typeof flags extends ...` is never user-visible.
+Stringly-typed `useFlag<S, K>('newCheckout')` is still exported for
+escape-hatch use cases (passing a handle through a context provider
+without owning the binding factory call site), but it is no longer the
+documented happy path. The codegen CLI (§2.11) augments either pattern
+and is explicitly NOT a prerequisite for type-safety.
 
 ### 4.5 Strict tsconfig
 
@@ -1741,15 +2352,20 @@ removing or renaming a code is breaking.
 | Code | Origin | Throws? | Returned via Result? |
 |---|---|---|---|
 | `INVALID_SCHEMA` | `defineFlags` / `createFlags` | yes (config-time) | — |
+| `INVALID_RUNTIME_OPTION` | `createRemoteSource({ pollInterval })` on Workers; `transport: 'sse'` on RN; etc. | yes (config-time) | — |
 | `UNKNOWN_FLAG` | `flags.get('typo')` (non-typed handle only) | no — returns ERROR result | yes |
 | `JSON_PARSE_ERROR` | `createJsonSource` | yes when path; via Result when watcher reload | yes |
+| `UNSAFE_MATCHER_FROM_JSON` | JSON / remote payload contains a `custom` matcher | yes (parse-time); via Result on remote-poll reload | yes |
 | `JSON_SCHEMA_ERROR` | json-flag `schema` validation | no — falls back to default | yes |
 | `TYPE_MISMATCH` | `coerce.ts` cannot coerce raw value to declared kind | no — falls back to default | yes |
 | `SOURCE_LOAD_FAILED` | `createRemoteSource` initial load | yes by default; opt-in to graceful | yes when `failOpen` |
-| `SOURCE_REFRESH_FAILED` | hot-reload tick | no — degraded snapshot served | yes |
+| `SOURCE_REFRESH_FAILED` | hot-reload tick | no — stale snapshot served | yes |
 | `PAYLOAD_TOO_LARGE` | remote source body | no — last snapshot served | yes |
 | `OBSERVABILITY_HOOK_ERROR` | user's `onEvaluation` threw | no — `console.error`d, ignored | no |
 | `RULE_EVAL_ERROR` | user's `custom` matcher threw | no — match returns `false` | yes |
+| `REGEX_TIMEOUT` | a `regex` matcher exceeded its per-call execution budget | no — match returns `false`; counter advances | yes |
+| `REGEX_DISABLED` | a `regex` pattern hit the auto-disable threshold | no — match returns `false` permanently for this snapshot | yes |
+| `STALE_READ` | sync `get()` / `getDetail()` called before `ready()` resolved | no — static default returned with `stale: true` | yes |
 
 ### 5.3 When to throw vs return Result
 
@@ -1784,18 +2400,25 @@ Biome lint config bans `throw new Error` in `src/`.
 
 ### 6.1 Subpath exports map
 
-The package ships **15 entry points** (see §8 / `package.json#exports`).
+The package ships **17 entry points** (see §8 / `package.json#exports`).
 Each is built as its own tsup entry, emits its own `.js` + `.d.ts`, and
 has a separate `size-limit` budget. A consumer who imports only
-`@devkit/flags` gets the core engine and absolutely nothing else; the
-JSON source, env source, remote source, every framework adapter, the
-OpenFeature provider, the observability taps and the CLI live behind
-`/sources/...`, `/adapters/...`, `/observe`, `/cli`.
+`@devkit/flags` gets the core engine — `defineFlags` / `createFlags` /
+`defaultsSource` / `FlagsError` / type helpers / the **core matcher
+set** (`eq` / `neq` / `in` / `nin` / `exists` / `segment`) — and
+absolutely nothing else. The extended matcher operators
+(`gt`/`gte`/`lt`/`lte`, `regex`, `contains`, `startsWith`, `endsWith`,
+`custom`), the Standard-Schema-V1 validator bridge, the JSON source,
+env source, remote source, every framework adapter, the OpenFeature
+provider, the observability taps and the CLI all live behind
+subpath imports.
 
 | Entry | Budget |
 |---|---|
 | `@devkit/flags` (core) | **3 KB** |
 | `@devkit/flags/errors` | 0.4 KB |
+| `@devkit/flags/matchers/extended` | **0.6 KB** *(new)* |
+| `@devkit/flags/validators/standard-schema` | **0.4 KB** *(new)* |
 | `@devkit/flags/sources/json` | 0.7 KB |
 | `@devkit/flags/sources/env` | 0.5 KB |
 | `@devkit/flags/sources/remote` | 1 KB |
@@ -1811,6 +2434,32 @@ OpenFeature provider, the observability taps and the CLI live behind
 
 The numbers are **gzipped** byte budgets enforced in CI by
 `size-limit` — a PR exceeding any budget fails the build.
+
+> **On the realism of the 3 KB core budget.** The original spec packed
+> 14 matcher operators, two factories, FNV-1a, AND/OR/NOT walker,
+> frozen snapshot, environment probe, coercion, observability fan-out,
+> initial-fetch coalescer, Standard-Schema duck-typing AND defaults
+> source into a single 3 KB entry. After review (back-of-envelope:
+> 3.5–4.2 KB gzipped post-`terser` + `mangleProps`), the core has been
+> narrowed by:
+>
+> - moving 9 matcher operators behind `@devkit/flags/matchers/extended`
+>   (~0.6 KB), with self-registration via the matcher registry — core
+>   ships only `eq` / `neq` / `in` / `nin` / `exists` / `segment`;
+> - moving the Standard-Schema-V1 `~standard.validate` bridge behind
+>   `@devkit/flags/validators/standard-schema` (~0.4 KB) — the
+>   `JsonFlagSpec.schema` field still TYPE-CHECKS the validator at
+>   compile time, but the runtime invocation lives in the bridge;
+> - keeping the 3 KB number realistic, not aspirational. CI gate fails
+>   on every PR; we'd rather discover headroom than ship 4 KB labeled
+>   "3 KB". A revised micro-budget breakdown is committed under
+>   `.size-limit-design.md` so we know where each byte goes.
+>
+> The rationale for keeping `eq`/`neq`/`in`/`nin`/`exists`/`segment`
+> in core: those five are the baseline every consumer reaches for
+> (kill switches, plan-tier targeting, segment composition); the rest
+> are situational and warrant the explicit opt-in on bundle-conscious
+> edge bundles.
 
 ### 6.2 `sideEffects: false`
 
@@ -1840,12 +2489,21 @@ Bundlers can therefore drop unimported re-exports during marking.
 unminified output. Internal-only properties begin with `_` so they get
 mangled to single letters; the public API has no `_`-prefixed surface.
 
-### 6.5 dual-runtime emit
+### 6.5 ESM-only emit
 
 Despite `type: module`, every entry emits a single `.js` (ESM only).
-Node 20+ + Bun + Deno + Workers all support ESM natively; we don't
-bother with a CJS shim. Consumers on legacy Node 18 must add a
-`tsx`/`tsm`-style ESM bootstrap or upgrade. Documented in README.
+**Node 20+** is the published floor (see `package.json#engines.node`)
+— we don't ship a CJS shim, and we don't support Node 18.
+
+The previous draft both pegged `engines: node>=20` and gestured at a
+`tsx`/`tsm`-style bootstrap for Node 18 users; that contradiction has
+been resolved in favour of a single supported lower bound. The market
+research report (`reports/09-feature-flags-lite.json`) lists Node ≥18
+in `technical_spec.runtime_targets` — that section will be amended in
+the next reports refresh to read `>=20`. README and `engines` are now
+aligned. Bun 1.0+, Deno 1.40+, Cloudflare Workers, Vercel Edge,
+Netlify Edge, and the browser support ESM natively; React Native via
+the standard ESM-aware Metro bundler.
 
 ---
 
@@ -2195,7 +2853,92 @@ might still throw. We wrap every invocation in a try/catch that emits
 A user's `custom: (v) => ...` callback that throws is treated as
 `false` (no match), and the error is reported via the observability
 hook with `code: 'RULE_EVAL_ERROR'`. We never let a user's matcher
-take down a request.
+take down a request. `custom` matchers from a JSON / remote source
+never reach this path — they are hard-rejected at parse time
+(`UNSAFE_MATCHER_FROM_JSON`, see §2.8.1.1).
+
+### 9.21 Cloudflare Workers — `setInterval` does not tick between requests
+
+The Workers runtime does NOT run a background event loop. `setInterval`
+callbacks only fire while a fetch handler is active; between requests,
+intervals are paused and any "due" tick is silently dropped. A naïve
+`createRemoteSource(url, { pollInterval: 60_000 })` therefore degrades
+to "snapshot is whatever it was the last time someone hit a long-lived
+request" — which looks like working code and is in fact a stale-data
+bug.
+
+The runtime probe in `utils/runtime.ts` resolves `'workers'` for the
+Cloudflare Workers / Workers-compatible Pages Functions runtime;
+`createRemoteSource` rejects `pollInterval` there at construction with
+`FlagsError('INVALID_RUNTIME_OPTION')` and a message pointing at the
+Cron Trigger / Durable Object pattern documented in §2.8.3. The
+synchronous `flags.get()` API is the request-fast-path read; the
+Cron Trigger or Durable Object alarm is the refresh driver. Tested in
+`test/runtime/workers.test.ts` against `@cloudflare/vitest-pool-workers`.
+
+### 9.22 React Native — SSE fallback unsupported
+
+`createRemoteSource(url, { transport: 'sse' })` uses `EventSource`
+when present and a `ReadableStream`-based fetch parser otherwise. RN's
+polyfilled `fetch` does not expose `Response.body.getReader()` in the
+common case (Hermes + `react-native@0.7x`), so the parser cannot
+decode the event stream. `'sse'` is rejected at construction on RN
+with `INVALID_RUNTIME_OPTION` and a message pointing the consumer at
+`'poll'`. Polling works on RN unmodified.
+
+### 9.23 PII-safe observability defaults
+
+By default, the observability hook + every built-in tap forwards only
+`subject.id` (an opaque, GDPR-compatible analytics identifier — same
+class as PostHog's `distinctId`). `subject.attributes` is OMITTED.
+Consumers who specifically need attributes in their analytics pipeline
+opt back in with `defineFlags({ redactSubject: (s) => s })`. The
+`toEndpoint` tap additionally exposes `forwardAttributes: true` for
+the case where the redactor opts in but the consumer wants
+selectively to suppress at the wire layer. README ships an
+`eu-residency.md` cookbook that covers GDPR-relevant configurations.
+
+### 9.24 Regex matcher execution budget + auto-disable
+
+Every `regex` matcher invocation runs under a documented per-call
+execution budget (default 50 ms, configurable via the matcher
+registry) implemented as a cooperative budget — when a single
+`String.prototype.match` exceeds the budget, the operator returns
+`false` and the observability hook receives `code: 'REGEX_TIMEOUT'`.
+After N consecutive timeouts on the same `(flagKey, regex)` pair
+(default N = 5), the pattern is auto-disabled for the remainder of
+the current snapshot's lifetime: subsequent matches return `false`
+without any further evaluation, and the next observe call uses
+`code: 'REGEX_DISABLED'`. A snapshot reload resets the counter — a
+fixed pattern recovers automatically. Documented in §2.6 / §5.2.
+
+### 9.25 Sync read before `ready()`
+
+A consumer who calls `flags.get(key)` before `await flags.ready()`
+returns gets:
+
+1. The static default (or the call-site `defaultValue`) as the value;
+2. `stale: true` and `reason: 'STALE'` on the `EvaluationResult`;
+3. A one-time observability event with `code: 'STALE_READ'` per
+   `(flagKey, snapshotEpoch)` pair (so a hot path doesn't spam).
+
+This is the "Suspense-or-fallback" branch React adapters render — the
+hooks treat `stale: true` as a signal to fan out a microtask
+`subscribe` so the next snapshot triggers a re-render. Documented in
+§2.3 / §2.9.1.
+
+### 9.26 `createEnvSource` allowlist defaults
+
+By default, `createEnvSource` reads only env-vars whose names map
+back to a flag declared in the `defineFlags` schema. An unrelated
+`FLAG_INTERNAL_DEBUG_TOKEN` env-var that happens to share the prefix
+is **ignored**. When the source sees a `${prefix}*` env-var that does
+NOT map to a declared flag, it emits a one-time `console.warn` with
+the candidate name so the consumer can spot a typo (`FLAG_NEW_CHECKOUTS`
+vs declared `newCheckout`). Pass `allow: '*'` to opt back in to the
+old "read everything matching the prefix" behaviour — required for
+`createFlags`-driven dynamic schemas where the schema isn't known at
+source-construction time. Documented in §2.8.2.
 
 ---
 
@@ -2233,3 +2976,264 @@ tool:
 
 These boundaries are what keep the core under 3 KB and the API
 learnable in 5 minutes.
+
+---
+
+## Review Changes
+
+This section logs every reviewer point from PR #1 (Mykhailo Kryvytskyi,
+`REQUEST_CHANGES` verdict) and the corresponding change applied to
+this document and `package.json`. Points are ordered by the reviewer's
+own severity tags.
+
+### Blocker — security: `Matcher.custom` + `Matcher.regex` loadable from JSON
+
+**Concern.** A compromised CDN could ship a `custom` matcher (RCE
+vector if a future loader interprets it) or a catastrophically-
+backtracking regex like `(a+)+$` (ReDoS, pegs the request thread).
+
+**Action — agreed.** §2.6 now documents `custom` as in-code-only and
+flags `regex` as sandboxed. §2.8.1.1 is a new sub-section that nails
+the JSON-source trust boundary: `parseFlagsJson` hard-rejects `custom`
+matchers with the new `UNSAFE_MATCHER_FROM_JSON` error code (§5.2),
+sandboxes every `regex` invocation under a per-call execution budget
+plus a per-pattern auto-disable counter (`REGEX_TIMEOUT` /
+`REGEX_DISABLED` codes added in §5.2; full semantics in §9.24), and
+caps regex literal length / lookbehind nesting at parse time. §1's
+test tree adds `test/correctness/json-matcher-safety.test.ts`.
+
+**Sections modified.** §1 (project tree, test tree), §2.6, §2.8.1.1
+(new), §5.2 (error table), §9.24 (new).
+
+### Blocker — DX: unconditional `Promise<T>` on `flags.get()` defeats render hot paths
+
+**Concern.** Forcing every consumer through Suspense / `useFlagValue`
+shadow APIs gives up the `flagged` / LaunchDarkly DX win
+(`useFeature('x')` returning a sync value).
+
+**Action — agreed.** §2.3's `FlagsHandle` is now a **dual sync/async
+surface**: `get` / `getAll` / `getDetail` are synchronous against the
+current snapshot; `getAsync` / `getAllAsync` / `getDetailAsync` keep
+the explicit `Promise<T>` shape for RSC / handlers / CLI code. A new
+`flags.ready()` is the boot await — `await flags.ready()` once, then
+synchronous everywhere. §2.2 introduces the `stale: true` flag on
+`EvaluationResult` so component render paths can opt into Suspense /
+fallback rendering without await ceremony. §2.9.1's React adapter is
+explicitly described as synchronous-first.
+
+**Sections modified.** §1 (TL;DR), §2.2 (`EvaluationResult`), §2.3
+(`FlagsHandle`), §2.9.1 (React adapter narration), §5.2 (`STALE_READ`
+error code), §9.25 (new edge case).
+
+### Blocker — bundle: 3 KB core unrealistic with 14 matchers + Standard Schema
+
+**Concern.** Back-of-envelope estimate is 3.5–4.2 KB gzipped after
+terser. Headline number wouldn't survive contact with reality.
+
+**Action — agreed.** Two new subpath entries:
+`@devkit/flags/matchers/extended` (~0.6 KB, hosts `gt`/`gte`/`lt`/
+`lte`/`regex`/`contains`/`startsWith`/`endsWith`/`custom`) and
+`@devkit/flags/validators/standard-schema` (~0.4 KB, hosts the
+Standard-Schema-V1 `~standard.validate` bridge). Core ships only
+`eq`/`neq`/`in`/`nin`/`exists`/`segment`. The 3 KB target stays but
+is now realistic. `package.json#exports` and `package.json#size-limit`
+were updated to match.
+
+**Sections modified.** §1 (TL;DR + project tree), §2.6 (Matcher core
+vs extended split), §6.1 (size-limit table + new realism note),
+`package.json` (new exports + size-limit entries).
+
+### High — type safety: `overrides?: Record<string, unknown>` and untyped `attributes`
+
+**Concern.** Typos like `newChckout` / `palan` go through silently;
+defeats the `defineFlags<T>()` pitch.
+
+**Action — agreed.** A second generic `TAttrs extends AttributeSchema`
+flows from the new `config.attributes` field through `Subject<TAttrs>`,
+`EvaluationContext<TAttrs, TSchema>`, and `RuleGroup<TAttrs, TSegments>`.
+`overrides` is now `Partial<FlagValuesOf<TSchema>>`, so a typo at the
+flag key OR at the value type is a compile-time error. Permissive
+default fallbacks preserve the "skip the second generic" ergonomics
+for prototyping.
+
+**Sections modified.** §2.1, §2.4, §2.5, §2.6 (`RuleGroup`), §4
+(`DefineFlagsConfig`).
+
+### High — edge runtime: `setInterval` doesn't tick between Workers requests
+
+**Concern.** Polling silently no-ops on Cloudflare Workers — the
+"runs unmodified in… Cloudflare Workers" claim was misleading.
+
+**Action — agreed.** §1's TL;DR now flags Workers as supported with a
+documented caveat. `createRemoteSource(url, { pollInterval })` rejects
+`pollInterval` on the Workers runtime with the new
+`INVALID_RUNTIME_OPTION` error code. §2.8.3 documents the Cron
+Trigger / Durable Object pattern (with a working code example). §9.21
+is a new edge-case entry. RN's missing `ReadableStream` exposure is
+also documented: `'sse'` transport rejected on RN with the same
+error code (§9.22).
+
+**Sections modified.** §1 (TL;DR), §2.8.3, §5.2, §9.21 (new), §9.22
+(new).
+
+### High — consistency: Node 18 vs 20 contradiction
+
+**Concern.** `package.json` says `engines.node >=20`; PLAN §1 line 9
+said `Node 20+`; the market research report's `technical_spec` listed
+`Node.js >=18`; §6.5 mentioned a `tsx`/`tsm` shim for legacy Node 18.
+Pick one.
+
+**Action — agreed.** `Node 20+` is the floor everywhere. §6.5 was
+rewritten to drop the Node 18 shim suggestion and to note explicitly
+that the report's `technical_spec.runtime_targets` will be amended
+in the next reports refresh to read `>=20`. §1 wording aligned. No
+runtime change needed (engines was already correct).
+
+**Sections modified.** §1 (TL;DR), §6.5.
+
+### High — API gap: per-call `defaultValue` argument
+
+**Concern.** Every competitor SDK (LaunchDarkly, Unleash, OpenFeature)
+accepts a per-call default; without one, kill-switch hot paths can't
+override the schema's stale value.
+
+**Action — agreed.** `get()` and `getAsync()` got an overload:
+`get(key, ctx, defaultValue)` returns `defaultValue` instead of the
+schema default when the pipeline aborts with `reason: 'ERROR'` or
+the snapshot is stale and the call site has a "kill switch under
+uncertainty" preference. Matches LaunchDarkly's
+`client.variation(k, u, fb)` and OpenFeature's
+`getXxxValue(k, fb)` signatures.
+
+**Sections modified.** §2.3.
+
+### Medium — API gap: named segments + prerequisite flags
+
+**Concern.** Every comparable lib supports named segments to stop
+rules from duplicating `{ plan: { in: ['pro','enterprise'] } }` —
+cheap to add now, painful to retrofit.
+
+**Action — agreed (segments).** `DefineFlagsConfig` now has a
+`segments?: Record<string, RuleGroup>` field; `RuleGroup` adds a
+`{ $segment: 'name' }` form whose name narrows to
+`keyof typeof config.segments`. JSON sources mirror with `segments`
+top-level + `{ $segment: 'name' }` matcher; the parser rejects
+unresolved references at load time (§2.8.1.1). **Prerequisite flags
+remain out of scope for 1.0** — they're a heavier feature
+(dependency-graph cycles, evaluation order semantics) and can land
+in 1.1 without breaking changes; we'll revisit once we see real
+usage signal. §10 unchanged on that point intentionally.
+
+**Sections modified.** §1 (TL;DR), §2.1 (`config.segments`), §2.6
+(`RuleGroup`, `Matcher`), §2.8.1 (`FlagsJson.segments`), §4
+(`DefineFlagsConfig.segments`).
+
+### Medium — security: PII in observability events
+
+**Concern.** Forwarding `subject.attributes` to PostHog / endpoint
+taps is a GDPR liability.
+
+**Action — agreed.** §2.10 now declares `Subject` as PII-safe by
+default in `EvaluationEvent`: only `subject.id` is forwarded. A new
+`config.redactSubject?: (s) => Partial<Subject>` (§2.1) lets consumers
+opt back in (`(s) => s` for full attributes, or a custom projection).
+Built-in `toPostHog` / `toEndpoint` taps additionally strip non-`id`
+fields as a belt-and-braces layer. §9.23 is a new edge-case entry; a
+future README will ship `eu-residency.md` per the reviewer's ask.
+
+**Sections modified.** §1 (TL;DR), §2.1 (`redactSubject`), §2.10,
+§9.23 (new).
+
+### Medium — security: `createEnvSource` reads every `FLAG_*`
+
+**Concern.** An accidental `FLAG_INTERNAL_DEBUG_TOKEN` collision
+leaks a secret into the snapshot and the observability hook.
+
+**Action — agreed.** §2.8.2 now defaults to a schema-derived
+allowlist: only env-vars whose names map back to a declared flag are
+read. `allow: '*'` is the explicit opt-out for `createFlags`-driven
+dynamic schemas. Unmapped collisions get a one-time `console.warn`
+naming the candidate so typos surface. §9.26 documents the contract.
+
+**Sections modified.** §2.8.2, §9.26 (new).
+
+### Medium — ergonomics: `useFlag<S, K>` requires `declare module` ambient
+
+**Concern.** Same friction `flagged` / `@vercel/flags` avoid by
+holding the schema in module scope.
+
+**Action — agreed.** §2.9.1 introduces `createReactBindings(handle)`
+— same trick as `tRPC`'s `createTRPCReact<AppRouter>()`. Returns a
+pre-narrowed `{ FlagsProvider, useFlag, useFlagResult, useFlags,
+Flag }` object whose hooks narrow against the handle's `TSchema` /
+`TAttrs` generics. No `declare module`, no codegen step.
+Stringly-typed `useFlag<S, K>` is still exported as an escape hatch,
+but the bindings factory is the documented happy path. §4.4 was
+rewritten to match.
+
+**Sections modified.** §2.9.1, §4.4.
+
+### Medium — naming: `peek()` and `degraded`
+
+**Concern.** "peek" reads as side-effect-free but fires the hook;
+"degraded" sounds like the system is sick.
+
+**Action — agreed.** `peek` → `getDetail` (pairs with `get`);
+`degraded` → `stale` everywhere (`EvaluationResult`, `EvaluationReason`,
+edge cases). The async sibling is `getDetailAsync`.
+
+**Sections modified.** §2.2, §2.3, §3.1 narration, §5 (new
+`STALE_READ` code), §9.25 (new).
+
+### Medium — type safety: `Rollout.variants` not linked to string-flag values
+
+**Concern.** Today
+`{ kind: 'string', values: ['a','b'] as const,
+  rollout: { variants: { c: 100 } } }` is structurally valid.
+
+**Action — agreed.** `Rollout` is now parameterised
+`Rollout<TValues, TAttrs>`; `variants` is typed
+`Partial<Record<TValues, number>>` when `TValues` is a string-literal
+union. The runtime `weights-sum-to-100` check from §9.7 was already
+documented; the type-system guard rail joins it as the second layer.
+
+**Sections modified.** §2.7.
+
+### Medium — spec hole: analytics-only rule (no value, no rollout)
+
+**Concern.** §3.1 pseudocode skips the case where a matched rule has
+neither `value` nor `rollout` (the "analytics-only" rule called out
+in §2.6).
+
+**Action — agreed.** §3.1 pseudocode now has an explicit branch:
+matched analytics-only rule fires `recordExposure(spec.key, rule.id)`,
+then **falls through** to the next rule. Test added:
+`test/correctness/analytics-only-rule.test.ts`.
+
+**Sections modified.** §1 (test tree), §3.1.
+
+### Low — `package.json#description` 700+ chars
+
+**Concern.** npm renders only ~250 chars on listing pages.
+
+**Action — agreed.** Description trimmed to ~290 chars; long form
+will live in README.
+
+**Sections modified.** `package.json` (description).
+
+### Disagreed / deferred
+
+- **Prerequisite flags** (medium API gap): deferred to 1.1.
+  Rationale: dependency-graph evaluation introduces cycle detection
+  and order semantics that compound the API surface; we want real
+  usage signal before locking in a shape. Named segments solve the
+  "stop duplicating rules" pain reviewer flagged; prerequisites are
+  the heavier "stop duplicating flag activation" pain that will be
+  easier to design once we see how segments are used in practice.
+  Logged in `## 10 — Out of Scope` implicitly via "Experiment-result
+  analysis, mutual-exclusion groups, pre-experiment sanity-checks —
+  explicitly deferred." Will be revisited explicitly in 1.1
+  RFC-thread.
+
+No other points were disagreed — every blocker, high, and medium
+that pertains to 1.0 has a concrete change above.
